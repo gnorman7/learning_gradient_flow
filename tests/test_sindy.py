@@ -1,7 +1,9 @@
 import torch
 import matplotlib.pyplot as plt
 from torchdiffeq import odeint
-from sindy_tools import create_sindy_library, get_derivative, create_predictor
+# from src.learning_gradient_flow.sindy_tools import create_sindy_library, get_derivative, create_predictor
+from learning_gradient_flow.sindy_tools import create_sindy_library, get_derivative, create_predictor
+
 
 def test_sindy_oscillator():
     """
@@ -70,38 +72,39 @@ def test_sindy_oscillator():
     assert torch.allclose(Xi, goal_Xi, atol=1e-1), "Xi coefficients do not match expected values."
 
 
-    plt.figure(figsize=(12, 5))
+    # plt.figure(figsize=(12, 5))
 
-    plt.subplot(1, 2, 1)
-    plt.plot(t_span.numpy(), true_solution[:, 0].numpy(), 'b-', label=r'True $x_1$')
-    plt.plot(t_span.numpy(), sindy_solution[:, 0].numpy(), 'r--', label=r'SINDy $x_1$')
-    plt.xlabel('Time')
-    plt.ylabel(r'Position ($x_1$)')
-    plt.title('Position vs Time')
-    plt.legend()
+    # plt.subplot(1, 2, 1)
+    # plt.plot(t_span.numpy(), true_solution[:, 0].numpy(), 'b-', label=r'True $x_1$')
+    # plt.plot(t_span.numpy(), sindy_solution[:, 0].numpy(), 'r--', label=r'SINDy $x_1$')
+    # plt.xlabel('Time')
+    # plt.ylabel(r'Position ($x_1$)')
+    # plt.title('Position vs Time')
+    # plt.legend()
 
-    plt.subplot(1, 2, 2)
-    plt.plot(t_span.numpy(), true_solution[:, 1].numpy(), 'b-', label=r'True $x_2$')
-    plt.plot(t_span.numpy(), sindy_solution[:, 1].numpy(), 'r--', label=r'SINDy $x_2$')
-    plt.xlabel('Time')
-    plt.ylabel(r'Velocity ($x_2$)')
-    plt.title('Velocity vs Time')
-    plt.legend()
+    # plt.subplot(1, 2, 2)
+    # plt.plot(t_span.numpy(), true_solution[:, 1].numpy(), 'b-', label=r'True $x_2$')
+    # plt.plot(t_span.numpy(), sindy_solution[:, 1].numpy(), 'r--', label=r'SINDy $x_2$')
+    # plt.xlabel('Time')
+    # plt.ylabel(r'Velocity ($x_2$)')
+    # plt.title('Velocity vs Time')
+    # plt.legend()
 
-    plt.tight_layout()
-    plt.savefig('sindy_comparison.png')
+    # plt.tight_layout()
+    # plt.savefig('sindy_comparison.png')
 
-    plt.figure(figsize=(6, 5))
-    plt.plot(true_solution[:, 0].numpy(), true_solution[:, 1].numpy(), 'b-', label='True')
-    plt.plot(sindy_solution[:, 0].numpy(), sindy_solution[:, 1].numpy(), 'r--', label='SINDy')
-    plt.xlabel(r'Position ($x_1$)')
-    plt.ylabel(r'Velocity ($x_1$)')
-    plt.title('Phase Space')
-    plt.legend()
-    plt.savefig('sindy_phase_space.png')
+    # plt.figure(figsize=(6, 5))
+    # plt.plot(true_solution[:, 0].numpy(), true_solution[:, 1].numpy(), 'b-', label='True')
+    # plt.plot(sindy_solution[:, 0].numpy(), sindy_solution[:, 1].numpy(), 'r--', label='SINDy')
+    # plt.xlabel(r'Position ($x_1$)')
+    # plt.ylabel(r'Velocity ($x_1$)')
+    # plt.title('Phase Space')
+    # plt.legend()
+    # plt.savefig('sindy_phase_space.png')
 
     print("All tests passed!")
-    return true_solution, sindy_solution, Xi
+    # return true_solution, sindy_solution, Xi
+    assert True, "All tests passed!"
 
 if __name__ == "__main__":
     test_sindy_oscillator()

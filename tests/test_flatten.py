@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import pytest
-from gradient_flow_optimizer import GradientFlowBase
+
+from learning_gradient_flow.gradient_flow_optimizer import VectorBasedOptimizer
 
 
 class SimpleNet(nn.Module):
@@ -17,11 +18,11 @@ class SimpleNet(nn.Module):
         return self.layer2(self.act(self.layer1(x)))
 
 
-class OptimizerTestClass(GradientFlowBase):
-    """Test subclass of GradientFlowBase with exposed flattening methods."""
+class OptimizerTestClass(VectorBasedOptimizer):
+    """Test subclass of VectorBasedOptimizer with exposed flattening methods."""
 
     def __init__(self, params):
-        super().__init__(params, dt=1e-3)
+        super().__init__(params)
 
     # Expose protected methods as public for testing
     def gather_flat(self, params_or_grads="params"):
@@ -128,3 +129,6 @@ def test_flatten_gradients(model, optimizer):
     manual_flat_grads = torch.cat([p.grad.flatten() for p in model.parameters()])
     assert torch.allclose(flat_grads_after, manual_flat_grads), \
         "Gradient flattening doesn't match manual flattening"
+
+if __name__ == "__main__":
+    pytest.main([__file__])

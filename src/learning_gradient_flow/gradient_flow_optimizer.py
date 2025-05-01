@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT  # Use PyTorch's type hint
 import learning_gradient_flow.sindy_tools as sindy_tools
 
-import pysindy as ps
+# import pysindy as ps
 import numpy as np
 
 try:
@@ -30,7 +30,7 @@ class VectorBasedOptimizer(Optimizer):
         params: Iterable of parameters to optimize
     """
 
-    def __init__(self, params: ParamsT, defaults: Dict[str, Any]) -> None:
+    def __init__(self, params: ParamsT, defaults: Optional[Dict[str, Any]] = {}) -> None:
         super().__init__(params, defaults)
 
         if len(self.param_groups) != 1:
