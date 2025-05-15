@@ -20,7 +20,7 @@ except ImportError:
         "Install with: pip install torchdiffeq"
     )
 
-__all__ = ["VectorBasedOptimizer", "GradientFlow"]
+__all__ = ["VectorBasedOptimizer", "GradientFlow", "SINDyFlow", "SINDyFlowTrustRegion", "TrustRegionControl"]
 
 
 class VectorBasedOptimizer(Optimizer):
@@ -326,6 +326,8 @@ class SINDyFlow(VectorBasedOptimizer):
                           include_bias: bool = True,
                           rcond: Optional[float] = 1e-7,
                           truncation_rank: Optional[int] = None,
+                          method: str = 'weak',
+                          test_mat_kwargs: Dict[str, Any] = {},
                           ) -> Callable[[Tensor], Tensor]:
         # first called when 'func_evals' == history_size
         # build the SINDy model using the history of parameters
@@ -336,12 +338,16 @@ class SINDyFlow(VectorBasedOptimizer):
             library = sindy_tools.create_sindy_library(input_dim=d,
                                                        poly_order=poly_order,
                                                        include_bias=include_bias)
-            Theta = library(x)  # history_size, P
-            Thetam2 = Theta[1:-1]  # history_size-2, P
-            # get the learning rate used in the backup optimizer
+            Theta = library(x)
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
-            dxdt = sindy_tools.get_derivative(dt_sindy, x)  # history_size-2, d
-            Xi = torch.linalg.lstsq(Thetam2, dxdt, rcond=rcond).solution
+            t_span = torch.arange(x.shape[0]) * dt_sindy
+            if method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
+            elif method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
+                                                                         test_mat_kwargs=test_mat_kwargs)
+
+            Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
 
             pred = sindy_tools.create_predictor(Xi, library)
         else:
@@ -358,10 +364,16 @@ class SINDyFlow(VectorBasedOptimizer):
                                                        poly_order=poly_order,
                                                        include_bias=include_bias)
             Theta = library(mode_coeffs.T)
-            Thetam2 = Theta[1:-1]
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
-            dmode_coeffs_dt = sindy_tools.get_derivative(dt_sindy, mode_coeffs.T)
-            Xi = torch.linalg.lstsq(Thetam2, dmode_coeffs_dt, rcond=rcond).solution
+            t_span = torch.arange(x.shape[0]) * dt_sindy
+
+            if method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span)
+            elif method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
+                                                                         test_mat_kwargs=test_mat_kwargs)
+
+            Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
 
             mode_pred = sindy_tools.create_predictor(Xi, library)
             # now, we need to create a predictor that takes in the full state and returns the state derivs,
@@ -374,12 +386,6 @@ class SINDyFlow(VectorBasedOptimizer):
                 # generate predictions on the mode coefficients
                 mode_pred_coeffs = mode_pred(cur_mode_coeffs)
                 # now, we need to convert the mode predictions back to the full state space
-                # should be able to change the order of these because they're linear...
-                # I.e. mode_pred_coeffs is a time derivative in the latent space.
-                # So we can go map this to the original space and still have the time derivative.
-                # With z = psi(y), and y = phi(z), we have a model for dz/dt = f(z) (SINDy)
-                # We want dy/dt. So dz/dt = d (psi(y)) /dt = dpsi/dy * dy/dt, meaning
-                # dy/dt = dpsi/dy^-1 * dz/dt. Yet, if psi is linear, this dpsi/dy^-1 term is just a matrix (phi).
                 dydt = U_svd @ mode_pred_coeffs
                 return dydt
 
@@ -430,6 +436,9 @@ class SINDyFlowTrustRegion(VectorBasedOptimizer):
             raise ValueError(f"Trust-region radius gamma must be positive: {gamma_tr_radius}")
         if trust_region_control is None:
             trust_region_control = TrustRegionControl()
+        # if ode_solver_options {}
+        if ode_solver_options == {}:
+            ode_solver_options = {'rtol': 1e-5, 'atol': 1e-6}
         super().__init__(
             params,
             defaults={"dt": dt,
@@ -552,6 +561,8 @@ class SINDyFlowTrustRegion(VectorBasedOptimizer):
                           include_bias: bool = True,
                           rcond: Optional[float] = 1e-7,
                           truncation_rank: Optional[int] = None,
+                          method: str = 'weak',
+                          test_mat_kwargs: Dict[str, Any] = {},
                           ) -> Callable[[Tensor], Tensor]:
         # first called when 'func_evals' == history_size
         # build the SINDy model using the history of parameters
@@ -560,14 +571,18 @@ class SINDyFlowTrustRegion(VectorBasedOptimizer):
         if truncation_rank is None:
             d = x.shape[1]
             library = sindy_tools.create_sindy_library(input_dim=d,
-                                                    poly_order=poly_order,
-                                                    include_bias=include_bias)
-            Theta = library(x)  # history_size, P
-            Thetam2 = Theta[1:-1]  # history_size-2, P
-            # get the learning rate used in the backup optimizer
+                                                       poly_order=poly_order,
+                                                       include_bias=include_bias)
+            Theta = library(x)
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
-            dxdt = sindy_tools.get_derivative(dt_sindy, x)  # history_size-2, d
-            Xi = torch.linalg.lstsq(Thetam2, dxdt, rcond=rcond).solution
+            t_span = torch.arange(x.shape[0]) * dt_sindy
+            if method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
+            elif method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
+                                                                         test_mat_kwargs=test_mat_kwargs)
+
+            Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
 
             pred = sindy_tools.create_predictor(Xi, library)
         else:
@@ -584,10 +599,16 @@ class SINDyFlowTrustRegion(VectorBasedOptimizer):
                                                     poly_order=poly_order,
                                                     include_bias=include_bias)
             Theta = library(mode_coeffs.T)
-            Thetam2 = Theta[1:-1]
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
-            dmode_coeffs_dt = sindy_tools.get_derivative(dt_sindy, mode_coeffs.T)
-            Xi = torch.linalg.lstsq(Thetam2, dmode_coeffs_dt, rcond=rcond).solution
+            t_span = torch.arange(x.shape[0]) * dt_sindy
+
+            if method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span)
+            elif method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
+                                                                         test_mat_kwargs=test_mat_kwargs)
+
+            Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
 
             mode_pred = sindy_tools.create_predictor(Xi, library)
             # now, we need to create a predictor that takes in the full state and returns the state derivs,
