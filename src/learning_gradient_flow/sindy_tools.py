@@ -1,7 +1,9 @@
-from typing import Tuple
+from typing import Optional, Any
+from typing import Tuple, Optional
 import torch
 import torch.nn as nn
 
+#%% Libraries
 def create_sindy_library(input_dim: int,
                        poly_order: int = 2,
                        include_bias: bool = True) -> nn.Module:
@@ -58,7 +60,23 @@ def create_sindy_library(input_dim: int,
 
     return SINDyLibrary(input_dim, poly_order, include_bias)
 
+def create_predictor(Xi: torch.Tensor, library):
+    """
+    Construct a predictor function for the SINDy system.
 
+    Xi: P,d coefficient matrix for system
+    library: SINDy library function, maps (_,d) -> (_,P)
+
+    """
+    # x is d,1
+    # library(x.T) is 1,P
+    def pred_fun(x: torch.Tensor) -> torch.Tensor:
+        Theta_row = library(x.T)  # (1,P)
+        dxdt_row = Theta_row @ Xi  # 1,P @ P,d = 1,d
+        return dxdt_row.T  # (d,1)
+    return pred_fun
+
+#%% Differentiation / Matrix Assembly
 def make_polynomial_bump(t_grid: torch.Tensor,
                          a: float,
                          b: float,
@@ -155,7 +173,6 @@ def create_test_mats(t_span: torch.Tensor,
     # Phi shape: (N, K), dPhi shape: (N, K)
     return Phi, dPhi
 
-
 def assemble_weak_matrices(X_data: torch.Tensor,
                            Theta: torch.Tensor,
                            t_span: torch.Tensor,
@@ -197,7 +214,6 @@ def assemble_strong_matrices(X_data: torch.Tensor,
     Thetam2 = Theta[1:-1]  # shape (n_t-2, P) to match dxdt shape
     return dxdt, Thetam2
 
-
 def get_derivative(dt, x: torch.Tensor):
     # assume equispaced t, with dt = 1
     # x: (..., N), return (..., N-2)
@@ -205,50 +221,150 @@ def get_derivative(dt, x: torch.Tensor):
     dxdt = dxdt / (2 * dt)  # central difference
     return dxdt
 
-def create_predictor(Xi: torch.Tensor, library):
+
+#%% Linear system solving
+def dense_solver(rhs_mat: torch.Tensor,
+                 lhs_target: torch.Tensor,
+                 rcond: Optional[float] = None,
+                 driver: Optional[str] = None,
+                 ) -> torch.Tensor:
+    return torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond, driver=driver).solution
+
+def stls_sparse_solver(
+    rhs_mat: torch.Tensor,
+    lhs_target: torch.Tensor,
+    threshold: float,
+    max_iter: int = 20,
+    rcond: Optional[float] = None,
+    driver: Optional[str] = None,
+    convergence_tol: float = 1e-7,
+    normalize_columns: bool = False
+) -> torch.Tensor:
     """
-    Construct a predictor function for the SINDy system.
 
-    Xi: P,d coefficient matrix for system
-    library: SINDy library function, maps (_,d) -> (_,P)
+    The core idea of STLS is to iteratively:
+    1. Solve the least-squares problem (Xi_dense = argmin ||lhs_mat - rhs_mat @ Xi||_2^2).
+    2. Threshold small coefficients in Xi_dense to zero.
+    3. Identify the set of non-zero ("active") coefficients.
+    4. Re-solve the least-squares problem using only the columns of rhs_mat corresponding
+       to these active coefficients.
+    This process is repeated until the coefficient matrix Xi converges or max_iter is reached.
 
+    Args:
+        rhs_mat (torch.Tensor): The right-hand side matrix in the equation system.
+                                In SINDy, this is often the library of candidate functions Theta(X).
+                                Shape: (n_samples, n_features).
+        lhs_mat (torch.Tensor): The left-hand side matrix or vector in the equation system.
+                                In SINDy, this is often the time derivatives X_dot.
+                                Shape: (n_samples, n_targets) or (n_samples,).
+        threshold (float): The threshold value. Coefficients in Xi with absolute
+                           magnitude smaller than this threshold are set to zero.
+                           If `normalize_columns` is True, this threshold applies to
+                           coefficients of the normalized system.
+        max_iter (int, optional): The maximum number of STLS iterations.
+                                  Defaults to 20.
+        rcond (Optional[float], optional): Cut-off ratio for small singular values of rhs_mat.
+                                           Passed to torch.linalg.lstsq. Defaults to None,
+                                           which uses machine precision based on dtype.
+        driver (Optional[str], optional): Name of the LAPACK driver to be used by torch.linalg.lstsq
+                                          ('gels', 'gelsy', 'gelsd', 'gelss').
+                                          Defaults to None (PyTorch chooses).
+        convergence_tol (float, optional): Tolerance for checking convergence of Xi.
+                                           The L-infinity norm of (Xi_new - Xi_old) is used.
+                                           Defaults to 1e-7.
+        normalize_columns (bool, optional): If True, normalizes the columns of rhs_mat (L2 norm)
+                                            before solving. This can improve numerical stability.
+                                            The coefficients Xi are then un-normalized before returning.
+                                            Defaults to False.
+    Returns:
+        torch.Tensor: The sparse coefficient matrix Xi.
+                      Shape: (n_features, n_targets) or (n_features,) if lhs_mat was 1D.
+
+    Raises:
+        ValueError: If input dimensions are incompatible or threshold is negative.
     """
-    # x is d,1
-    # library(x.T) is 1,P
-    def pred_fun(x: torch.Tensor) -> torch.Tensor:
-        Theta_row = library(x.T) # (1,P)
-        dxdt_row = Theta_row @ Xi  # 1,P @ P,d = 1,d
-        return dxdt_row.T  # (d,1)
-    return pred_fun
 
-if __name__ == "__main__":
-    # Example usage:
-    d = 10
-    n_t = 100
-    t_span = torch.linspace(0, 1, n_t)  # time points
-    library = create_sindy_library(input_dim=d, poly_order=2)
-    x = torch.randn(n_t, d) # transpose of data matrix?
-    Theta = library(x)  # shape (n_t, P)
+    if threshold < 0:
+        raise ValueError("Threshold must be non-negative.")
 
-    lhs_target, rhs_mat = assemble_strong_matrices(x, Theta, t_span)
-    lhs_weak_target, rhs_weak_mat = assemble_weak_matrices(x, Theta, t_span)
-    # print and compare number of equations for the two methods
-    print("Strong form equations:", lhs_target.shape[0])
-    print("Weak form equations:", lhs_weak_target.shape[0])
+    n_features = rhs_mat.shape[1]
+    n_targets = lhs_target.shape[1]
+    device = rhs_mat.device
+    dtype = rhs_mat.dtype
 
-    # now construct the system: (n_t-2, d) = (n_t-2, P) @ (P, d)
-    # dxdt = Thetam2 @ Xi
-    Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=1e-5).solution
-    Xi_weak = torch.linalg.lstsq(rhs_weak_mat, lhs_weak_target, rcond=1e-5).solution
-    print("Xi shape:", Xi.shape)  # shape (P, d)
-    print("Xi_weak shape:", Xi_weak.shape)  # shape (P, d)
+    # Optional column normalization for rhs_mat
+    current_rhs_mat = rhs_mat
+    if normalize_columns:
+        col_norms = torch.linalg.norm(rhs_mat, ord=2, dim=0, keepdim=True)  # Shape (1, n_features)
+        # Avoid division by zero for zero columns (norm is 0).
+        # If norm is zero, column is zero; division by 1 keeps it zero.
+        col_norms[col_norms == 0] = 1.0
+        current_rhs_mat = rhs_mat / col_norms
+    else:
+        # Create a dummy col_norms for consistent un-normalization step (division by 1)
+        col_norms = torch.ones((1, n_features), device=device, dtype=dtype)
 
-    pred = create_predictor(Xi, library)
-    x_pred = pred(x[0:1].T) # input is (1,d) transposed to be (d,1)
-    print(x_pred.shape)  # shape (d, 1)
+    # Initial guess for Xi using all features (dense solve)
+    # Solves current_rhs_mat @ Xi = lhs_target
 
-    pred_weak = create_predictor(Xi_weak, library)
-    x_pred_weak = pred_weak(x[0:1].T)
-    print(x_pred_weak.shape)
+    xi = torch.linalg.lstsq(
+        current_rhs_mat,
+        lhs_target,
+        rcond=rcond,
+        driver=driver
+    ).solution
 
-    print("Xi_weak - Xi:", Xi_weak - Xi)  # should be small, but not zero
+    # STLS iteration
+    for _iteration in range(max_iter):
+        xi_old = xi.clone()
+
+        # Thresholding step: Identify coefficients smaller than threshold
+        # This is applied to Xi, which are coefficients for current_rhs_mat (potentially normalized)
+        small_indices_mask = torch.abs(xi) < threshold
+        xi[small_indices_mask] = 0.0
+
+        # Re-solve for non-zero coefficients for each target variable
+        for j in range(n_targets):
+            # Identify non-zero ("active") coefficients for this target *after* current thresholding
+            active_coeffs_mask_j = (xi[:, j] != 0.0)  # Boolean mask of shape (n_features,)
+
+            if not torch.any(active_coeffs_mask_j):
+                # All coefficients for this target are zero, ensure xi for this target is all zero
+                xi[:, j] = 0.0
+                continue
+
+            # Select corresponding columns from current_rhs_mat (the matrix used in lstsq)
+            rhs_mat_sparse_j = current_rhs_mat[:, active_coeffs_mask_j]
+
+            target_vector_j = lhs_target[:, j]  # Shape (n_samples,)
+
+            solution_active_j = torch.linalg.lstsq(
+                rhs_mat_sparse_j,
+                target_vector_j,
+                rcond=rcond,
+                driver=driver
+            ).solution
+
+            xi[active_coeffs_mask_j, j] = solution_active_j.squeeze()
+
+        # Check for convergence using L-infinity norm of the change in Xi
+        # Xi here is still potentially scaled if normalize_columns=True.
+        # The comparison is consistent as both xi and xi_old are at the same scale.
+        diff_norm = torch.linalg.norm(xi - xi_old, ord=float('inf'))
+        if diff_norm < convergence_tol:
+            # print(f"STLS converged after {_iteration + 1} iterations.")
+            break
+
+    # else: # Executed if loop finishes without break
+        # print(f"STLS reached max_iter ({max_iter}). Final diff_norm: {diff_norm:.2e}")
+
+    # Un-normalize Xi if columns of rhs_mat were normalized
+    # Xi_final = Xi_scaled / col_norms_transposed
+    # col_norms has shape (1, n_features). col_norms.T has shape (n_features, 1).
+    # Xi has shape (n_features, n_targets).
+    # Broadcasting (n_features, n_targets) / (n_features, 1) divides each feature's coefficient
+    # across all targets by that feature's norm.
+    if normalize_columns:  # Check again, as col_norms might be all ones if not normalized
+        xi = xi / col_norms.T
+
+    return xi
