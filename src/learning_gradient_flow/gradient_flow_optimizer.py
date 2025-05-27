@@ -110,10 +110,12 @@ class VectorBasedOptimizer(Optimizer):
 
 
 class GradientFlow(VectorBasedOptimizer):
-    """
-    Implements standard Gradient Flow using ODE integration:
-        d(params)/dt = - grad(L(params))
-    Uses `torchdiffeq.odeint`.
+    r"""
+    Implements standard Gradient Flow using ODE integration via
+    `torchdiffeq.odeint <https://github.com/rtqichen/torchdiffeq?tab=readme-ov-file#keyword-arguments-for-odeint_adjoint>`_.
+
+    .. math::
+        \frac{d(params)}{dt} = - \nabla L(params)
     """
 
     def __init__(
@@ -239,7 +241,7 @@ class SINDyFlow(VectorBasedOptimizer):
         ode_solver_options: Dict[str, Any] = {},
         history_size: int = 100,
         retrain_interval: int = 200,
-        sindy_kwargs: Dict[str, Any] = {},
+        sindy_params: sindy_tools.SINDyParams = None
     ):
         if torchdiffeq_odeint is None:
             raise ImportError(
@@ -252,19 +254,20 @@ class SINDyFlow(VectorBasedOptimizer):
             warnings.warn("Func Evals will likely be incorrect for LBFGS optimizer.")
         if retrain_interval < history_size:
             raise ValueError(f"Retrain interval must be greater than or equal to history size: {retrain_interval}!")
+        if sindy_params is None:
+            sindy_params = sindy_tools.SINDyParams()
         super().__init__(
             params,
             defaults={"dt": dt,
                       "ode_solver_options":ode_solver_options,
                       "history_size": history_size,
-                      "retrain_interval": retrain_interval,
-                      "sindy_kwargs": sindy_kwargs}
+                      "retrain_interval": retrain_interval}
         )
         self.state['history'] = [] # tracks the parameter history
         self.state['history_count'] = 0
         self.state['epoch'] = 0
         self.backup_optimizer = backup_optimizer
-        self.sindy_kwargs = sindy_kwargs
+        self.sindy_params = sindy_params
 
     def step(self, closure: Callable[[], Tensor]) -> Optional[Tensor]:
         closure = torch.enable_grad()(closure)
@@ -296,7 +299,7 @@ class SINDyFlow(VectorBasedOptimizer):
 
             # build sindy model if it doesn't already exist
             if self.dynamics is None:
-                pred = self.build_sindy_model(**self.sindy_kwargs)
+                pred = self.build_sindy_model(sindy_params=self.sindy_params)
                 self.dynamics = lambda t, y: pred(y)
 
             # This will be (d,1) integration!
@@ -322,25 +325,18 @@ class SINDyFlow(VectorBasedOptimizer):
             self.state['epoch'] += 1
             return orig_loss
 
-    def build_sindy_model(self, poly_order: int = 1,
-                          include_bias: bool = True,
-                          truncation_rank: Optional[int] = None,
-                          method: str = 'weak',
-                          test_mat_kwargs: Dict[str, Any] = {},
-                          solver_fn: Callable[[Tensor, Tensor, Dict[str, Any]], Tensor] = sindy_tools.dense_solver,
-                          solver_kwargs: Dict[str, Any] = {},
-                          ) -> Callable[[Tensor], Tensor]:
+    def build_sindy_model(self, sindy_params: sindy_tools.SINDyParams) -> Callable[[Tensor], Tensor]:
         """Uses self.state['history'] to build a SINDy model.
         Args:
-            poly_order (int): Polynomial order for the library.
-            include_bias (bool): Whether to include a constant term.
-            truncation_rank (Optional[int]): Rank for SVD truncation, None == no SVD.
-            method (str): 'strong' or 'weak' for system construction.
-            test_mat_kwargs (Dict[str, Any]): For 'weak', kwargs for sindy_tools.assemble_weak_matrices
-            solver_fn (Callable): Function to solve the linear system, takes rhs_mat, lhs_target, kwargs.
-            solver_kwargs (Dict[str, Any]): kwargs for the solver function.
+            poly_order: Polynomial order for the library.
+            include_bias: Whether to include a constant term.
+            truncation_rank: Rank for SVD truncation, None == no SVD.
+            method: 'strong' or 'weak' for system construction.
+            test_func_params: For 'weak', param object to be passed to sindy_tools.assemble_weak_matrices
+            solver_fn: Function to solve the linear system, takes rhs_mat, lhs_target, solver_params.
+            solver_kwargs: kwargs for the solver function.
         Returns:
-            Callable[[Tensor], Tensor]: A function that takes in a state and returns the state derivative.
+            A function that takes in a state and returns the state derivative.
         """
 
 
@@ -349,30 +345,29 @@ class SINDyFlow(VectorBasedOptimizer):
         # each entry of self.state['history'] is a tensor of shape (num_params,)
 
         x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
-        if truncation_rank is None:
+        if sindy_params.truncation_rank is None:
             d = x.shape[1]
             library = sindy_tools.create_sindy_library(input_dim=d,
-                                                       poly_order=poly_order,
-                                                       include_bias=include_bias)
+                                                       poly_order=sindy_params.poly_order,
+                                                       include_bias=sindy_params.include_bias)
             Theta = library(x)
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
             t_span = torch.arange(x.shape[0]) * dt_sindy
-            if method == 'strong':
+            if sindy_params.method == 'strong':
                 lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
-            elif method == 'weak':
+            elif sindy_params.method == 'weak':
                 lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
-                                                                         test_mat_kwargs=test_mat_kwargs)
+                                                                         test_func_params=sindy_params.test_func_params)
             else:
-                raise ValueError(f"Method {method} not recognized. Use 'strong' or 'weak'.")
+                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
 
-            # Replace this with a general solution method for solving the linear system. This should take the rhs_mat,
-            # lhs_target (and other kwargs) and return the solution Xi, e.g.
-            # Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
-            # Xi = torch.linalg.lstsq(rhs_mat, lhs_target, **solver_kwargs).solution
-            Xi = solver_fn(rhs_mat, lhs_target, **solver_kwargs)
+            # General solution method for solving the linear system.
+            # This should take the rhs_mat, lhs_target, and params object, returning the solution Xi
+            Xi = sindy_params.solver_fn(rhs_mat, lhs_target, sindy_params.solver_params)
 
             pred = sindy_tools.create_predictor(Xi, library)
         else:
+            truncation_rank = sindy_params.truncation_rank
             # Build SINDy model in SVD modes.
             # Note, this is different from MATLAB, as it returns Vh or V.T, not V
             U_full_svd, s_full_svd, Vh_full_svd = torch.linalg.svd(x.T, full_matrices=False)
@@ -383,26 +378,24 @@ class SINDyFlow(VectorBasedOptimizer):
             mode_coeffs = torch.diag(s_svd) @ Vh_svd
             # now, we can build the library on the mode coefficients
             library = sindy_tools.create_sindy_library(input_dim=truncation_rank,
-                                                       poly_order=poly_order,
-                                                       include_bias=include_bias)
+                                                       poly_order=sindy_params.poly_order,
+                                                       include_bias=sindy_params.include_bias)
             Theta = library(mode_coeffs.T)
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
             t_span = torch.arange(x.shape[0]) * dt_sindy
 
-            if method == 'strong':
+            if sindy_params.method == 'strong':
                 lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span)
-            elif method == 'weak':
+            elif sindy_params.method == 'weak':
                 lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
-                                                                         test_mat_kwargs=test_mat_kwargs)
+                                                                         test_func_params=sindy_params.test_func_params)
             else:
-                raise ValueError(f"Method {method} not recognized. Use 'strong' or 'weak'.")
+                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
 
 
-            # Replace this with a general solution method for solving the linear system. This should take the rhs_mat,
-            # lhs_target (and other kwargs) and return the solution Xi, e.g.
-            # Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
-            # Xi = torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond).solution
-            Xi = solver_fn(rhs_mat, lhs_target, **solver_kwargs)
+            # General solution method for solving the linear system.
+            # This should take the rhs_mat, lhs_target, and params object, returning the solution Xi
+            Xi = sindy_params.solver_fn(rhs_mat, lhs_target, sindy_params.solver_params)
 
             mode_pred = sindy_tools.create_predictor(Xi, library)
             # now, we need to create a predictor that takes in the full state and returns the state derivs,
@@ -434,7 +427,6 @@ class TrustRegionControl:
 
     def __str__(self) -> str:
         return "\n".join(f"{key}: {value}" for key, value in asdict(self).items())
-
 
 
 class SINDyFlowTrustRegion(VectorBasedOptimizer):

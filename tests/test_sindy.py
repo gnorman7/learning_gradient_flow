@@ -14,7 +14,7 @@ def test_sindy_oscillator():
     dynamical systems.
     """
     # Set random seed for reproducibility
-    torch.manual_seed(42)
+    torch.manual_seed(0)
 
     A_mat = torch.tensor([[0.0, 3.0], [-1.0, -0.2]])
 

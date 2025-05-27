@@ -1,5 +1,5 @@
-from typing import Optional, Any
-from typing import Tuple, Optional
+from typing import Optional, Any, Tuple, Optional, Protocol
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
@@ -173,10 +173,18 @@ def create_test_mats(t_span: torch.Tensor,
     # Phi shape: (N, K), dPhi shape: (N, K)
     return Phi, dPhi
 
+@dataclass
+class TestFunctionParams:
+    """Parameters for creating test functions."""
+    width: Optional[int] = None
+    p: int = 5
+    stride: int = 1
+    include_endpoints: bool = True
+
 def assemble_weak_matrices(X_data: torch.Tensor,
                            Theta: torch.Tensor,
                            t_span: torch.Tensor,
-                           test_mat_kwargs: dict = {},
+                           test_func_params: Optional[TestFunctionParams] = None,
                            ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
@@ -191,11 +199,17 @@ def assemble_weak_matrices(X_data: torch.Tensor,
             X_data_dPhi: (K, d) target matrix, representing the time derivative
             Theta_Phi: (K, P) matrix multiplying the coefficients, representing library Theta
     """
-    # get defaults for test_mat_kwargs
-    if 'width' not in test_mat_kwargs:
-        test_mat_kwargs['width'] = (len(t_span) // 25) // 2
+    if test_func_params is None:
+        test_func_params = TestFunctionParams()
+    if test_func_params.width is None:
+        width = max(1, (len(t_span) // 25) // 2)
+        test_func_params.width = width
 
-    Phi, dPhi = create_test_mats(t_span, **test_mat_kwargs)
+    Phi, dPhi = create_test_mats(t_span,
+                                 width=test_func_params.width,
+                                 p=test_func_params.p,
+                                 stride=test_func_params.stride,
+                                 include_endpoints=test_func_params.include_endpoints)
     dt = t_span[1] - t_span[0]
 
     Theta_Phi_3d = torch.bmm(Phi.unsqueeze(2), Theta.unsqueeze(1))
@@ -223,24 +237,63 @@ def get_derivative(dt, x: torch.Tensor):
 
 
 #%% Linear system solving
+@dataclass
+class BaseSolverParams:
+    """Base class for solver parameters, corresponds to BaseSolver"""
+    pass
+
+@dataclass
+class DenseSolverParams(BaseSolverParams):
+    """Collected parameters to be passed to pytorch.linalg.lstsq.
+
+    Args:
+        rcond: optional cutoff for the least-squares solver.
+        driver: optional driver for the least-squares solver.
+    """
+    rcond: Optional[float] = None
+    driver: Optional[str] = None
+
+@dataclass
+class SparseSolverParams(BaseSolverParams):
+    """Collected parameters for the sparse solver.
+
+    Args:
+        threshold: threshold for culling small coefficients on each iteration.
+        max_iter: maximum number of iterations for the STLS algorithm.
+        rcond: optional cutoff for the least-squares solver.
+        driver: optional driver for the least-squares solver (see PyTorch docs).
+        convergence_tol: tolerance change in Xi for convergence.
+        normalize_columns: whether to normalize columns of rhs_mat before solving.
+    """
+    threshold: float = 0.01
+    max_iter: int = 20
+    rcond: Optional[float] = None
+    driver: Optional[str] = None
+    convergence_tol: float = 1e-7
+    normalize_columns: bool = False
+
+class BaseSolver(Protocol):
+    """Protocol that defines the expected signature for solver functions."""
+    def __call__(self, rhs_mat: torch.Tensor, lhs_target: torch.Tensor,
+                 BaseSolverParams: BaseSolverParams) -> torch.Tensor:
+        pass
+
 def dense_solver(rhs_mat: torch.Tensor,
                  lhs_target: torch.Tensor,
-                 rcond: Optional[float] = None,
-                 driver: Optional[str] = None,
+                 dense_solver_params: DenseSolverParams = None
                  ) -> torch.Tensor:
-    return torch.linalg.lstsq(rhs_mat, lhs_target, rcond=rcond, driver=driver).solution
+    """Standard least-squares solve via PyTorch."""
+    if dense_solver_params is None:
+        dense_solver_params = DenseSolverParams()
+    return torch.linalg.lstsq(rhs_mat, lhs_target,
+                              rcond=dense_solver_params.rcond,
+                              driver=dense_solver_params.driver).solution
 
-def stls_sparse_solver(
-    rhs_mat: torch.Tensor,
-    lhs_target: torch.Tensor,
-    threshold: float,
-    max_iter: int = 20,
-    rcond: Optional[float] = None,
-    driver: Optional[str] = None,
-    convergence_tol: float = 1e-7,
-    normalize_columns: bool = False
-) -> torch.Tensor:
-    """
+def stls_sparse_solver(rhs_mat: torch.Tensor,
+                       lhs_target: torch.Tensor,
+                       sparse_solver_params: SparseSolverParams = None
+                       ) -> torch.Tensor:
+    r"""
 
     The core idea of STLS is to iteratively:
     1. Solve the least-squares problem (Xi_dense = argmin ||lhs_mat - rhs_mat @ Xi||_2^2).
@@ -251,41 +304,14 @@ def stls_sparse_solver(
     This process is repeated until the coefficient matrix Xi converges or max_iter is reached.
 
     Args:
-        rhs_mat (torch.Tensor): The right-hand side matrix in the equation system.
-                                In SINDy, this is often the library of candidate functions Theta(X).
-                                Shape: (n_samples, n_features).
-        lhs_mat (torch.Tensor): The left-hand side matrix or vector in the equation system.
-                                In SINDy, this is often the time derivatives X_dot.
-                                Shape: (n_samples, n_targets) or (n_samples,).
-        threshold (float): The threshold value. Coefficients in Xi with absolute
-                           magnitude smaller than this threshold are set to zero.
-                           If `normalize_columns` is True, this threshold applies to
-                           coefficients of the normalized system.
-        max_iter (int, optional): The maximum number of STLS iterations.
-                                  Defaults to 20.
-        rcond (Optional[float], optional): Cut-off ratio for small singular values of rhs_mat.
-                                           Passed to torch.linalg.lstsq. Defaults to None,
-                                           which uses machine precision based on dtype.
-        driver (Optional[str], optional): Name of the LAPACK driver to be used by torch.linalg.lstsq
-                                          ('gels', 'gelsy', 'gelsd', 'gelss').
-                                          Defaults to None (PyTorch chooses).
-        convergence_tol (float, optional): Tolerance for checking convergence of Xi.
-                                           The L-infinity norm of (Xi_new - Xi_old) is used.
-                                           Defaults to 1e-7.
-        normalize_columns (bool, optional): If True, normalizes the columns of rhs_mat (L2 norm)
-                                            before solving. This can improve numerical stability.
-                                            The coefficients Xi are then un-normalized before returning.
-                                            Defaults to False.
+        rhs_mat: The matrix multiplying the coefficients, e.g. library functions.
+        lhs_target: The target matrix, e.g. time derivative of the state.
+        SparseSolverParams: Parameters for the sparse solver, including e.g. threshold.
     Returns:
-        torch.Tensor: The sparse coefficient matrix Xi.
-                      Shape: (n_features, n_targets) or (n_features,) if lhs_mat was 1D.
-
-    Raises:
-        ValueError: If input dimensions are incompatible or threshold is negative.
+        The sparse coefficient matrix Xi such that lhs_mat \approx rhs_mat @ Xi.
     """
-
-    if threshold < 0:
-        raise ValueError("Threshold must be non-negative.")
+    if sparse_solver_params is None:
+        sparse_solver_params = SparseSolverParams()
 
     n_features = rhs_mat.shape[1]
     n_targets = lhs_target.shape[1]
@@ -294,7 +320,7 @@ def stls_sparse_solver(
 
     # Optional column normalization for rhs_mat
     current_rhs_mat = rhs_mat
-    if normalize_columns:
+    if sparse_solver_params.normalize_columns:
         col_norms = torch.linalg.norm(rhs_mat, ord=2, dim=0, keepdim=True)  # Shape (1, n_features)
         # Avoid division by zero for zero columns (norm is 0).
         # If norm is zero, column is zero; division by 1 keeps it zero.
@@ -310,17 +336,17 @@ def stls_sparse_solver(
     xi = torch.linalg.lstsq(
         current_rhs_mat,
         lhs_target,
-        rcond=rcond,
-        driver=driver
+        rcond=sparse_solver_params.rcond,
+        driver=sparse_solver_params.driver
     ).solution
 
     # STLS iteration
-    for _iteration in range(max_iter):
+    for _iteration in range(sparse_solver_params.max_iter):
         xi_old = xi.clone()
 
         # Thresholding step: Identify coefficients smaller than threshold
         # This is applied to Xi, which are coefficients for current_rhs_mat (potentially normalized)
-        small_indices_mask = torch.abs(xi) < threshold
+        small_indices_mask = torch.abs(xi) < sparse_solver_params.threshold
         xi[small_indices_mask] = 0.0
 
         # Re-solve for non-zero coefficients for each target variable
@@ -341,8 +367,8 @@ def stls_sparse_solver(
             solution_active_j = torch.linalg.lstsq(
                 rhs_mat_sparse_j,
                 target_vector_j,
-                rcond=rcond,
-                driver=driver
+                rcond=sparse_solver_params.rcond,
+                driver=sparse_solver_params.driver
             ).solution
 
             xi[active_coeffs_mask_j, j] = solution_active_j.squeeze()
@@ -351,7 +377,7 @@ def stls_sparse_solver(
         # Xi here is still potentially scaled if normalize_columns=True.
         # The comparison is consistent as both xi and xi_old are at the same scale.
         diff_norm = torch.linalg.norm(xi - xi_old, ord=float('inf'))
-        if diff_norm < convergence_tol:
+        if diff_norm < sparse_solver_params.convergence_tol:
             # print(f"STLS converged after {_iteration + 1} iterations.")
             break
 
@@ -364,7 +390,19 @@ def stls_sparse_solver(
     # Xi has shape (n_features, n_targets).
     # Broadcasting (n_features, n_targets) / (n_features, 1) divides each feature's coefficient
     # across all targets by that feature's norm.
-    if normalize_columns:  # Check again, as col_norms might be all ones if not normalized
+    if sparse_solver_params.normalize_columns:  # Check again, as col_norms might be all ones if not normalized
         xi = xi / col_norms.T
 
     return xi
+
+#%% Overarching config
+@dataclass
+class SINDyParams:
+    """Configuration for SINDy library, system construction, and linear solver."""
+    poly_order: int = 1
+    include_bias: bool = True
+    truncation_rank: Optional[int] = None
+    method: str = 'weak'
+    test_func_params: Optional[TestFunctionParams] = None
+    solver_fn: BaseSolver = dense_solver
+    solver_params: Optional[BaseSolverParams] = None

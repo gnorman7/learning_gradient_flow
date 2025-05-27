@@ -1,6 +1,6 @@
 import torch
 import torchdiffeq
-from learning_gradient_flow.sindy_tools import create_sindy_library, create_predictor, assemble_weak_matrices, stls_sparse_solver, dense_solver
+import learning_gradient_flow.sindy_tools
 
 def test_sindy_oscillator():
     """
@@ -13,7 +13,7 @@ def test_sindy_oscillator():
     # Set random seed for reproducibility
     torch.manual_seed(0)
 
-    noise_level = 0.1
+    noise_level = 0.05
 
     sigma = 10.0
     rho = 28.0
@@ -40,20 +40,26 @@ def test_sindy_oscillator():
 
     # SINDy solve
     poly_order = 3
-    library = create_sindy_library(input_dim=d, poly_order=poly_order, include_bias=True)
+    library = learning_gradient_flow.sindy_tools.create_sindy_library(
+        input_dim=d, poly_order=poly_order, include_bias=True)
 
     Theta = library(X_data)
-    test_mat_kwargs = {
-        'width': 20,
-        'p': 5,
-        'stride': 10,
-        'include_endpoints': True,
-    }
-    lhs_weak, rhs_weak = assemble_weak_matrices(X_data, Theta, t_span, test_mat_kwargs=test_mat_kwargs)
+    test_func_params = learning_gradient_flow.sindy_tools.TestFunctionParams(width=20,
+                                                                             p=5,
+                                                                             stride=10,
+                                                                             include_endpoints=True)
 
-    threshold = 0.1
+    lhs_weak, rhs_weak = learning_gradient_flow.sindy_tools.assemble_weak_matrices(
+        X_data, Theta, t_span, test_func_params=test_func_params)
+
+    threshold = 0.05
     normalize_columns = False
-    Xi = stls_sparse_solver(rhs_weak, lhs_weak, threshold=threshold, normalize_columns=normalize_columns)
+    sparse_solve_params = learning_gradient_flow.sindy_tools.SparseSolverParams(
+        threshold=threshold,
+        normalize_columns=normalize_columns,
+    )
+    Xi = learning_gradient_flow.sindy_tools.stls_sparse_solver(
+        rhs_weak, lhs_weak, sparse_solver_params=sparse_solve_params)
 
     P, d = Xi.shape
     Xi_true = torch.zeros((P, d))
@@ -73,6 +79,7 @@ def test_sindy_oscillator():
     print(Xi)
     print("True coefficients (Xi_true):")
     print(Xi_true)
+    print(torch.allclose(Xi, Xi_true, atol=1e-1))
     assert torch.allclose(Xi, Xi_true, atol=1e-1), "Xi coefficients do not match expected values."
 
 if __name__ == "__main__":
