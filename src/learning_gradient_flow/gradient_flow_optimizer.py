@@ -20,7 +20,7 @@ except ImportError:
         "Install with: pip install torchdiffeq"
     )
 
-__all__ = ["VectorBasedOptimizer", "GradientFlow", "SINDyFlow", "SINDyFlowTrustRegion", "TrustRegionControl"]
+__all__ = ["VectorBasedOptimizer", "GradientFlow", "SINDyFlow", "SINDyFlowTrustRegion", "TrustRegionControl", "BatchedSINDyFlow"]
 
 
 class VectorBasedOptimizer(Optimizer):
@@ -325,6 +325,25 @@ class SINDyFlow(VectorBasedOptimizer):
             self.state['epoch'] += 1
             return orig_loss
 
+    def get_sindy_mats(self, sindy_params: sindy_tools.SINDyParams) -> tuple[Tensor, Tensor]:
+        """Returns lhs_target and rhs_mat"""
+        x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
+        d = x.shape[1]
+        library = sindy_tools.create_sindy_library(input_dim=d,
+                                                   poly_order=sindy_params.poly_order,
+                                                   include_bias=sindy_params.include_bias)
+        Theta = library(x)
+        dt_sindy = self.backup_optimizer.param_groups[0]['lr']
+        t_span = torch.arange(x.shape[0]) * dt_sindy
+        if sindy_params.method == 'strong':
+            lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
+        elif sindy_params.method == 'weak':
+            lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
+                                                                        test_func_params=sindy_params.test_func_params)
+        else:
+            raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
+        return lhs_target, rhs_mat, library
+
     def build_sindy_model(self, sindy_params: sindy_tools.SINDyParams) -> Callable[[Tensor], Tensor]:
         """Uses self.state['history'] to build a SINDy model.
         Args:
@@ -344,22 +363,8 @@ class SINDyFlow(VectorBasedOptimizer):
         # build the SINDy model using the history of parameters
         # each entry of self.state['history'] is a tensor of shape (num_params,)
 
-        x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
         if sindy_params.truncation_rank is None:
-            d = x.shape[1]
-            library = sindy_tools.create_sindy_library(input_dim=d,
-                                                       poly_order=sindy_params.poly_order,
-                                                       include_bias=sindy_params.include_bias)
-            Theta = library(x)
-            dt_sindy = self.backup_optimizer.param_groups[0]['lr']
-            t_span = torch.arange(x.shape[0]) * dt_sindy
-            if sindy_params.method == 'strong':
-                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
-            elif sindy_params.method == 'weak':
-                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
-                                                                         test_func_params=sindy_params.test_func_params)
-            else:
-                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
+            rhs_mat, lhs_target, library = self.get_sindy_mats(sindy_params)
 
             # General solution method for solving the linear system.
             # This should take the rhs_mat, lhs_target, and params object, returning the solution Xi
@@ -367,6 +372,7 @@ class SINDyFlow(VectorBasedOptimizer):
 
             pred = sindy_tools.create_predictor(Xi, library)
         else:
+            x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
             truncation_rank = sindy_params.truncation_rank
             # Build SINDy model in SVD modes.
             # Note, this is different from MATLAB, as it returns Vh or V.T, not V
@@ -648,6 +654,155 @@ class SINDyFlowTrustRegion(VectorBasedOptimizer):
         # dot(y) = g(y), this is g(y).
         # dot(y) = f(t, y) = g(y), f is dynamics
         return pred
+
+
+class BatchedSINDyFlow:
+    """
+    Batch multiple optimizers with SindyFlow, but use a batched appraoch for the model building.
+    """
+
+    def __init__(
+        self,
+        # params_list: list[ParamsT],
+        backup_optimizers: list[Optimizer],
+        dt: float = 1e-3,
+        ode_solver_options: Dict[str, Any] = {},
+        history_size: int = 100,
+        retrain_interval: int = 200,
+        sindy_params: sindy_tools.SINDyParams = None,
+        retain_all_states: bool = False,
+    ):
+        """
+        Args:
+            params: Iterable of parameters to optimize
+            backup_optimizers: List of optimizers to use during history collection phase
+            dt: Time interval for integration per step
+            ode_solver_options: Options passed to torchdiffeq.odeint
+            history_size: Number of steps to collect before building SINDy model
+            retrain_interval: Number of steps between retraining the SINDy model
+            sindy_params: Configuration for SINDy library and solver
+            retain_all_states: Whether to use all observations (ever) for SINDy model, e.g. not just the recent ones.
+        """
+        if torchdiffeq_odeint is None:
+            raise ImportError(
+                "torchdiffeq library is required for BatchedSINDyFlow. "
+                "Install with: pip install torchdiffeq"
+            )
+
+        if sindy_params is None:
+            sindy_params = sindy_tools.SINDyParams()
+
+        sindy_flow_optimizers = []
+        for i, backup_optimizer in enumerate(backup_optimizers):
+            sindy_flow_optimizer = SINDyFlow(backup_optimizer.param_groups[0]['params'],
+                                             backup_optimizer=backup_optimizer,
+                                             dt=dt,
+                                             ode_solver_options=ode_solver_options,
+                                             history_size=history_size*100,
+                                             retrain_interval=retrain_interval*100,
+                                             sindy_params=sindy_params)
+            sindy_flow_optimizers.append(sindy_flow_optimizer)
+        self.sindy_flow_optimizers = sindy_flow_optimizers
+
+        self.state = {
+            'history_count': 0,
+            'epoch': 0,
+            'func_evals': 0,
+        }
+
+        self.retrain_interval = retrain_interval
+        self.history_size = history_size
+        self.dynamics = None
+        self.sindy_params = sindy_params
+        self.dt = dt
+        self.retain_all_states = retain_all_states
+        self.lhs_targets = []
+        self.rhs_mats = []
+
+
+    def step(self, closures: list[Callable[[], Tensor]]) -> Optional[list[Tensor]]:
+        if self.state['epoch'] % self.retrain_interval == 0:
+            self.state['history_count'] = 0
+            self.dynamics = None
+
+        if self.state['history_count'] < self.history_size:
+            losses = []
+            func_eval_count = 0
+            for closure, sindy_flow_optimizer in zip(closures, self.sindy_flow_optimizers):
+                loss = sindy_flow_optimizer.step(closure)
+                losses.append(loss)
+                func_eval_count += sindy_flow_optimizer.state['func_evals']
+            self.state['history_count'] += 1
+            self.state['epoch'] += 1
+            self.state['func_evals'] = func_eval_count
+            return losses
+
+        # In this case, we have enough history for sindy model!
+
+        # We evaluate this loss, but don't do anything with it.
+        orig_losses = []
+        for closure, sindy_flow_optimizer in zip(closures, self.sindy_flow_optimizers):
+            orig_loss = closure()
+            orig_losses.append(orig_loss)
+            # self.state['func_evals'] += 1 # don't count these, we don't use them.
+
+        if self.dynamics is None:
+            if not self.retain_all_states:
+                # reset the matrices if we're not retaining all states
+                self.lhs_targets = []
+                self.rhs_mats = []
+            for sindy_flow_optimizer in self.sindy_flow_optimizers:
+                lhs_target, rhs_mat, library = sindy_flow_optimizer.get_sindy_mats(sindy_flow_optimizer.sindy_params)
+                self.lhs_targets.append(lhs_target)
+                self.rhs_mats.append(rhs_mat)
+
+            big_rhs_mat = torch.cat(self.rhs_mats, dim=0)
+            big_lhs_target = torch.cat(self.lhs_targets, dim=0)
+            # print the sizes
+            print(f"big_rhs_mat shape: {big_rhs_mat.shape}, big_lhs_target shape: {big_lhs_target.shape}")
+
+            Xi = self.sindy_params.solver_fn(big_rhs_mat, big_lhs_target, self.sindy_params.solver_params)
+
+            print(f'Xi: {Xi}')
+
+            pred = sindy_tools.create_predictor(Xi, library)
+
+            self.dynamics = lambda t, y: pred(y)
+
+        for sindy_flow_optimizer in self.sindy_flow_optimizers:
+            t_span = torch.tensor([0.0, sindy_flow_optimizer.param_groups[0]['dt']])
+            y0 = sindy_flow_optimizer._gather_flat("params")
+            y_result = torchdiffeq_odeint(
+                self.dynamics,
+                y0.unsqueeze(1),
+                t_span,
+                **sindy_flow_optimizer.param_groups[0]["ode_solver_options"]
+            ).squeeze(-1)
+            y_final = y_result[-1]
+            sindy_flow_optimizer._set_params_from_flat(y_final)
+
+        self.state['epoch'] += 1
+
+        return orig_losses
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     # def build_sindy_model(self, poly_order: int = 1, include_bias: bool = True, rcond: Optional[float] = 1e-5):
     #     dt_sindy = self.backup_optimizer.param_groups[0]['lr']
