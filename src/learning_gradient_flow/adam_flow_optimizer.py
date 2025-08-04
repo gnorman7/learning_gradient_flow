@@ -6,12 +6,14 @@ from dataclasses import dataclass, asdict
 import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT  # Use PyTorch's type hint
-import learning_gradient_flow.sindy_tools as sindy_tools
 
 # import pysindy as ps
 import numpy as np
 import learning_gradient_flow.gradient_flow_optimizer
-import learning_gradient_flow.sindy_tools
+import learning_gradient_flow.sindy_tools as sindy_tools
+
+from learning_gradient_flow.gradient_flow_optimizer import VectorBasedOptimizer, TrustRegionControl
+from learning_gradient_flow.sindy_tools import SINDyParams
 
 try:
     from torchdiffeq import odeint as torchdiffeq_odeint
@@ -22,11 +24,10 @@ except ImportError:
         "Install with: pip install torchdiffeq"
     )
 
-__all__ = ["VectorBasedOptimizer", "GradientFlow", "SINDyFlow", "SINDyFlowTrustRegion", "TrustRegionControl"]
 
 
 # Only support a single parameter group.
-class CustomAdam(learning_gradient_flow.gradient_flow_optimizer.VectorBasedOptimizer):
+class CustomAdam(VectorBasedOptimizer):
     def __init__(
         self,
         params: ParamsT,
@@ -463,7 +464,7 @@ class AdamEuler(learning_gradient_flow.gradient_flow_optimizer.VectorBasedOptimi
         return self.loss
 
 
-class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBasedOptimizer):
+class BaseAdamEulerLearned(VectorBasedOptimizer):
     def __init__(
         self,
         params: ParamsT,
@@ -471,8 +472,7 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
         betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
         eps: Union[float, Tensor] = 1e-8,
         history_size: int = 100,
-        retrain_interval: int = 200,
-        sindy_params: learning_gradient_flow.sindy_tools.SINDyParams = None
+        sindy_params: Optional[SINDyParams] = None
     ):
         if not lr > 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -482,13 +482,8 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        if retrain_interval < history_size:
-            raise ValueError(f"Retrain interval must be greater than or equal to history size: {retrain_interval}!")
-        if sindy_params is None:
-            sindy_params = learning_gradient_flow.sindy_tools.SINDyParams()
 
-        defaults = dict(lr=lr, betas=betas, eps=eps,
-                        history_size=history_size, retrain_interval=retrain_interval)
+        defaults = dict(lr=lr, betas=betas, eps=eps, history_size=history_size)
         super().__init__(params, defaults)
         self.state['epoch'] = 0
         self.state['history'] = []
@@ -530,6 +525,16 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
             flat_grad = self._gather_flat("grads")
             return flat_grad
 
+    def _reset_model(self) -> bool:
+        """Determines when the SINDy model should be reset. Should be True on the first iteration!"""
+        raise NotImplementedError(
+            "This method should be implemented in subclasses to determine when to reset the model."
+        )
+
+    def _check_grad_alignment(self, flat_params: Tensor, flat_grad: Tensor, dt: float) -> Tensor:
+        """Optionally checks if the gradient is aligned with the parameters."""
+        return flat_grad
+
     def step(self, closure: Callable[[], Tensor], same_time=False) -> Optional[Tensor]:
         """
         same_time: If True, update params, momentum, and variance at the same time, more resembling ODE, otherwise
@@ -542,7 +547,6 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
         lr = group['lr']
         eps = group['eps']
         history_size: int = group['history_size']
-        retrain_interval: int = group['retrain_interval']
         self.evals_in_step = [0]  # Use list to pass by reference
 
         dt = lr
@@ -556,8 +560,7 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
             self.expanded_state[:, 2] = (1 - beta2) * (flat_grad ** 2)
             self.state['epoch'] += 1
 
-
-        if self.state['epoch'] % retrain_interval == 1:
+        if self._reset_model():
             self.state['history'] = []
             self.state['grad_history'] = []
             self.state['history_count'] = 0
@@ -576,10 +579,12 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
             # build grad model if it doesn't already exist
             if self.dynamics is None:
                 pred = self.build_sindy_model(sindy_params=self.sindy_params)
-                self.dynamics = lambda y: pred(y) # Don't need t dependence, as custom ODE solve
+                self.dynamics = lambda y: pred(y)  # Don't need t dependence, as custom ODE solve
 
             # evaluate the model to get the grad
             flat_grad = self.dynamics(flat_params)
+            flat_grad = self._check_grad_alignment(flat_params, flat_grad, dt)
+
             # Compute loss, but it isn't used (or counted)
             self.loss = self.closure()
 
@@ -714,3 +719,117 @@ class AdamEulerLearned(learning_gradient_flow.gradient_flow_optimizer.VectorBase
         # dot(y) = g(y), this is g(y).
         # dot(y) = f(t, y) = g(y), f is dynamics
         return pred
+
+
+class AdamEulerLearned(BaseAdamEulerLearned):
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: Union[float, Tensor] = 1e-3,
+        betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
+        eps: Union[float, Tensor] = 1e-8,
+        history_size: int = 100,
+        retrain_interval: int = 200,
+        sindy_params: Optional[SINDyParams] = None
+    ):
+        super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size, sindy_params=sindy_params)
+        if retrain_interval < history_size:
+            raise ValueError(f"Retrain interval must be greater than or equal to history size: {retrain_interval}!")
+        self.retrain_interval = retrain_interval
+
+    def _reset_model(self) -> bool:
+        """Check if the model should be reset based on the retrain interval."""
+        return self.state['epoch'] % self.retrain_interval == 1
+
+
+class AdamEulerLearnedTR(BaseAdamEulerLearned):
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: Union[float, Tensor] = 1e-3,
+        betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
+        eps: Union[float, Tensor] = 1e-8,
+        history_size: int = 100,
+        trust_region_control: TrustRegionControl = TrustRegionControl(),
+        gamma_tr_radius: float = None,
+        sindy_params: Optional[SINDyParams] = None,
+        use_data_driven_thresh: bool = False
+    ):
+        super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size, sindy_params=sindy_params)
+        self.trust_region_control = trust_region_control
+        if gamma_tr_radius is None:
+            gamma_tr_radius = lr
+        self.gamma_tr_radius = gamma_tr_radius
+
+        self.should_reset = True
+        self.use_data_driven_thresh = use_data_driven_thresh
+
+    def _reset_model(self) -> bool:
+        """Check if the model should be reset based on the trust region control."""
+        if self.should_reset:
+            self.should_reset = False
+            return True
+        else:
+            return False
+
+    # TODO: use the grads from the history to get a reference range for acceptable angle differences
+    # That is, compute the cosine similarity within self.state['history'] and use that to
+    # inform thresholds, scaling trc.cosine_similarity_good_threshold and trc.cosine_similarity_bad_threshold
+    def _check_grad_alignment(self,
+                              flat_params: torch.Tensor,
+                              flat_grad: torch.Tensor,
+                              dt: float,
+                              ) -> Tensor:
+        y_diff = flat_params - self.state['history'][-1]
+        y_diff_norm = torch.norm(y_diff, p=2)
+        if y_diff_norm <= self.gamma_tr_radius:
+            # We are within the trust region, so we can use the predicted gradient
+
+            self._set_params_from_flat(flat_params)
+
+            return flat_grad
+        else:
+            # We've exceeded the trust region
+            # We'll compare against the true gradient, so return that regardless.
+            # Still need to figure out how we change TR, and if we scrap the model.
+            trc = self.trust_region_control
+
+            if self.use_data_driven_thresh:
+                # Use cosine similarity from history to get an idea of threshold adjustment
+                number_of_cosines = min(3, len(self.state['grad_history']) - 1)
+                cosines = []
+
+                # get cosine similarities between the last few pairs
+                # we could build some model, either with a distribution or with the change in this over time etc.
+                # but for now, just use the last few pairs, assuming they're measuring the same thing
+                for i in range(1, number_of_cosines + 1):
+                    grad1 = self.state['grad_history'][-i]
+                    grad2 = self.state['grad_history'][-(i + 1)]
+                    cos_sim = torch.cosine_similarity(grad1, grad2, dim=0)
+                    cosines.append(cos_sim.item())
+
+                # Use the median cosine similarity as a threshold
+                data_driven_thresh = torch.median(torch.tensor(cosines, dtype=flat_grad.dtype, device=flat_grad.device)).item()
+                data_driven_thresh = max(data_driven_thresh, 0.1) # no negative allowed.
+            else:
+                data_driven_thresh = 1.0
+
+            true_grad = self._get_grad(self._gather_flat('params'))
+            if torch.norm(true_grad) < trc.grad_tol * dt and torch.norm(flat_grad) < trc.grad_tol * dt:
+                self.gamma_tr_radius *= 1.25
+            else:
+                cos_sim = torch.cosine_similarity(true_grad, flat_grad, dim=0)
+                if cos_sim < trc.cosine_similarity_bad_threshold * data_driven_thresh:
+                    self.gamma_tr_radius *= trc.radius_factor_bad
+                    self.should_reset = True
+                elif cos_sim < trc.cosine_similarity_good_threshold * data_driven_thresh:
+                    # Alternatively for these two, we could interpolate the factor based on the cos sim
+                    self.gamma_tr_radius *= trc.radius_factor_okay
+                    self.should_reset = False
+                else:
+                    self.gamma_tr_radius *= trc.radius_factor_good
+                    self.should_reset = False
+            self.gamma_tr_radius = min(self.gamma_tr_radius, trc.max_radius)
+
+            return true_grad
+
