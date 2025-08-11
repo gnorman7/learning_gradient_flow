@@ -472,7 +472,7 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
         betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
         eps: Union[float, Tensor] = 1e-8,
         history_size: int = 100,
-        sindy_params: Optional[SINDyParams] = None
+        sindy_params: Optional[SINDyParams] = None,
     ):
         if not lr > 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
