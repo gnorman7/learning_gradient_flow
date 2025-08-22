@@ -439,6 +439,7 @@ class AdamEuler(learning_gradient_flow.gradient_flow_optimizer.VectorBasedOptimi
             variance = self.expanded_state[:, 2] + dt * d_variance_dt
 
         # epoch = t/dt
+        # Note: even with same_time, we update from k+1, not from k (step_t = epoch + 1)
         unbiased_momentum = momentum / (1 - beta1 ** step_t)
         unbiased_variance = variance / (1 - beta2 ** step_t)
 
@@ -473,6 +474,9 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
         eps: Union[float, Tensor] = 1e-8,
         history_size: int = 100,
         sindy_params: Optional[SINDyParams] = None,
+        subsample_factor: int = 1,
+        points_added: int = 0,
+        debug: bool = False
     ):
         if not lr > 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -483,16 +487,21 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
 
-        defaults = dict(lr=lr, betas=betas, eps=eps, history_size=history_size)
+        defaults = dict(lr=lr, betas=betas, eps=eps, history_size=history_size,
+                        subsample_factor=subsample_factor)
         super().__init__(params, defaults)
         self.state['epoch'] = 0
         self.state['history'] = []
         self.state['grad_history'] = []
         self.state['history_count'] = 0
+        self.state['sub_epoch'] = 0
         flat_params = self._gather_flat('params')
         self.expanded_state = torch.zeros(len(flat_params), 3, dtype=flat_params.dtype, device=flat_params.device)
         self.expanded_state[:, 0] = flat_params
         self.loss = None
+        self.debug = debug
+        self.points_added = points_added
+
         if sindy_params is None:
             sindy_params = learning_gradient_flow.sindy_tools.SINDyParams()
             sindy_params.method = 'tracked'
@@ -525,10 +534,10 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
             flat_grad = self._gather_flat("grads")
             return flat_grad
 
-    def _reset_model(self) -> bool:
+    def _check_model_reset(self) -> bool:
         """Determines when the SINDy model should be reset. Should be True on the first iteration!"""
         raise NotImplementedError(
-            "This method should be implemented in subclasses to determine when to reset the model."
+            "This method should be implemented in subclasses to determine WHEN to reset the model."
         )
 
     def _check_grad_alignment(self, flat_params: Tensor, flat_grad: Tensor, dt: float) -> Tensor:
@@ -560,11 +569,14 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
             self.expanded_state[:, 2] = (1 - beta2) * (flat_grad ** 2)
             self.state['epoch'] += 1
 
-        if self._reset_model():
+        if self._check_model_reset():
             self.state['history'] = []
             self.state['grad_history'] = []
             self.state['history_count'] = 0
             self.dynamics = None
+            if self.debug:
+                print(f"[{self.__class__.__name__}] "
+                      f"Epoch {self.state['epoch']}: Resetting SINDy model.")
 
         # -------------------------------------------------------
         # Begin the evaluation of the time derivative function
@@ -575,61 +587,151 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
             self.state['history'].append(flat_params)
             self.state['grad_history'].append(flat_grad)
             self.state['history_count'] += 1
+            model_is_active = False
         else:
             # build grad model if it doesn't already exist
             if self.dynamics is None:
-                pred = self.build_sindy_model(sindy_params=self.sindy_params)
+                pred = self.build_sindy_model(sindy_params=self.sindy_params, points_added=self.points_added)
                 self.dynamics = lambda y: pred(y)  # Don't need t dependence, as custom ODE solve
 
             # evaluate the model to get the grad
             flat_grad = self.dynamics(flat_params)
             flat_grad = self._check_grad_alignment(flat_params, flat_grad, dt)
 
+            model_is_active = True
+
             # Compute loss, but it isn't used (or counted)
             self.loss = self.closure()
 
-        self.state['epoch'] += 1
-        step_t = self.state['epoch']
+        if not model_is_active:
+            self.state['epoch'] += 1
+            step_t = self.state['epoch']
 
-        # Apply the Euler update step, but just to the momentum and variance
-        d_momentum_dt = ((1 - beta1) / dt) * (flat_grad - self.expanded_state[:, 1])
-        d_variance_dt = ((1 - beta2) / dt) * (flat_grad ** 2 - self.expanded_state[:, 2])
+            # Apply the Euler update step, but just to the momentum and variance
+            d_momentum_dt = ((1 - beta1) / dt) * (flat_grad - self.expanded_state[:, 1])
+            d_variance_dt = ((1 - beta2) / dt) * (flat_grad ** 2 - self.expanded_state[:, 2])
 
-        # Do update for these AT THE SAME TIME as params
-        if same_time:
-            momentum = self.expanded_state[:, 1]
-            variance = self.expanded_state[:, 2]
-        else:
-            # Do update for these BEFORE using for params, like upwinding or Nesterov
-            momentum = self.expanded_state[:, 1] + dt * d_momentum_dt
-            variance = self.expanded_state[:, 2] + dt * d_variance_dt
+            # Do update for these AT THE SAME TIME as params
+            if same_time:
+                momentum = self.expanded_state[:, 1]
+                variance = self.expanded_state[:, 2]
+            else:
+                # Do update for these BEFORE using for params, like upwinding or Nesterov
+                momentum = self.expanded_state[:, 1] + dt * d_momentum_dt
+                variance = self.expanded_state[:, 2] + dt * d_variance_dt
 
-        # epoch = t/dt
-        unbiased_momentum = momentum / (1 - beta1 ** step_t)
-        unbiased_variance = variance / (1 - beta2 ** step_t)
+            # epoch = t/dt
+            unbiased_momentum = momentum / (1 - beta1 ** step_t)
+            unbiased_variance = variance / (1 - beta2 ** step_t)
 
-        # Now update the parameters using the updated momentum and variance
-        d_params_dt = -unbiased_momentum / (unbiased_variance.sqrt() + eps)
-        flat_params += d_params_dt * dt
+            # Now update the parameters using the updated momentum and variance
+            d_params_dt = -unbiased_momentum / (unbiased_variance.sqrt() + eps)
+            flat_params += d_params_dt * dt
 
-        if same_time:
-            momentum = self.expanded_state[:, 1] + dt * d_momentum_dt
-            variance = self.expanded_state[:, 2] + dt * d_variance_dt
+            if same_time:
+                momentum = self.expanded_state[:, 1] + dt * d_momentum_dt
+                variance = self.expanded_state[:, 2] + dt * d_variance_dt
 
-        # End the evaluation of the time derivative function
-        # -------------------------------------------------------
+            # End the evaluation of the time derivative function
+            # -------------------------------------------------------
+
+            self.state['func_evals'] += self.evals_in_step[0]
+            self.expanded_state = torch.stack(
+                [flat_params, momentum, variance], dim=1
+            )
+            self._set_params_from_flat(flat_params)
+
+            return self.loss
+
+        # Otherwise, model IS active, so we will use the subsampled grid.
+        max_subepochs = self.defaults['subsample_factor']
+        sub_dt = dt / max_subepochs
+        for sub_epoch in range(max_subepochs):
+            step_t = self.state['epoch'] + (sub_epoch+1) / max_subepochs
+            # Apply the Euler update step, but just to the momentum and variance
+            d_momentum_dt = ((1 - beta1) / sub_dt) * (flat_grad - self.expanded_state[:, 1])
+            d_variance_dt = ((1 - beta2) / sub_dt) * (flat_grad ** 2 - self.expanded_state[:, 2])
+
+            # Do update for these AT THE SAME TIME as params
+            if same_time:
+                momentum = self.expanded_state[:, 1]
+                variance = self.expanded_state[:, 2]
+            else:
+                # Do update for these BEFORE using for params, like upwinding or Nesterov
+                momentum = self.expanded_state[:, 1] + sub_dt * d_momentum_dt
+                variance = self.expanded_state[:, 2] + sub_dt * d_variance_dt
+
+            # epoch = t/dt
+            unbiased_momentum = momentum / (1 - beta1 ** step_t)
+            unbiased_variance = variance / (1 - beta2 ** step_t)
+
+            # Now update the parameters using the updated momentum and variance
+            d_params_dt = -unbiased_momentum / (unbiased_variance.sqrt() + eps)
+            flat_params += d_params_dt * sub_dt
+
+            if same_time:
+                momentum = self.expanded_state[:, 1] + sub_dt * d_momentum_dt
+                variance = self.expanded_state[:, 2] + sub_dt * d_variance_dt
+
+            if sub_epoch < max_subepochs - 1:
+                flat_grad = self.dynamics(flat_params)
+                # flat_grad = self._check_grad_alignment(flat_params, flat_grad, dt)
 
         self.state['func_evals'] += self.evals_in_step[0]
-
         self.expanded_state = torch.stack(
             [flat_params, momentum, variance], dim=1
         )
-        # Update the parameters in the optimizer
         self._set_params_from_flat(flat_params)
 
+        self.state['epoch'] += 1
         return self.loss
 
-    def build_sindy_model(self, sindy_params: sindy_tools.SINDyParams) -> Callable[[Tensor], Tensor]:
+    def interpolate(self, state: torch.Tensor, points_added: int = 0, order: int = 2) -> torch.Tensor:
+        # state is history_size by num_params
+        # Assume that the state is given equispaced. We will return equispaced too.
+        # We will return something that is history_size * (1+points_added) by num_params
+        history_size, num_params = state.shape
+        if history_size < 3 and order == 2:
+            raise ValueError("Cannot interpolate with order 2 on less than 3 points.")
+        if points_added == 0:
+            return state.clone()
+
+        out = []
+        for i in range(history_size - 1):
+            out.append(state[i])
+            if order == 1:
+                for k in range(1, points_added+1):
+                    alpha = k / (points_added + 1)
+                    new_point = (1 - alpha) * state[i] + alpha * state[i + 1]
+                    out.append(new_point)
+            elif order == 2:
+                if i == 0:
+                    # Forward quadratic: points at x = 0, 1, 2
+                    p0, p1, p2 = state[0], state[1], state[2]
+                    for k in range(1, points_added + 1):
+                        t = k / (points_added + 1)
+                        L0 = (t - 1) * (t - 2) / 2.0
+                        L1 = t * (2 - t)
+                        L2 = t * (t - 1) / 2.0
+                        out.append(p0 * L0 + p1 * L1 + p2 * L2)
+                else:
+                    # Centered quadratic: points at x = -1, 0, 1
+                    pm, p0, pp = state[i - 1], state[i], state[i + 1]
+                    for k in range(1, points_added + 1):
+                        t = k / (points_added + 1)
+                        Lm = t * (t - 1) / 2.0
+                        L0 = 1.0 - t * t
+                        Lp = t * (t + 1) / 2.0
+                        out.append(pm * Lm + p0 * L0 + pp * Lp)
+
+        out.append(state[-1])  # Always append the last point
+        out = torch.stack(out, dim=0)
+
+        return out
+
+
+    def build_sindy_model(self, sindy_params: sindy_tools.SINDyParams,
+                          points_added: int = 0) -> Callable[[Tensor], Tensor]:
         """Uses self.state['history'] to build a SINDy model.
         Args:
             poly_order: Polynomial order for the library.
@@ -648,6 +750,9 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
         # each entry of self.state['history'] is a tensor of shape (num_params,)
 
         x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
+        n_hist = x.shape[0]
+        x = self.interpolate(x, points_added=points_added, order=2)
+
         if sindy_params.truncation_rank is None:
             d = x.shape[1]
             library = sindy_tools.create_sindy_library(input_dim=d,
@@ -655,7 +760,9 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
                                                        include_bias=sindy_params.include_bias)
             Theta = library(x)
             dt_sindy = self.param_groups[0]['lr']
-            t_span = torch.arange(x.shape[0]) * dt_sindy
+            # t_span = torch.arange(n_hist) * dt_sindy
+            dt_intp = dt_sindy / (1 + points_added)
+            t_span = torch.arange(x.shape[0]) * dt_intp
             if sindy_params.method == 'strong':
                 lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
             elif sindy_params.method == 'weak':
@@ -663,6 +770,7 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
                                                                          test_func_params=sindy_params.test_func_params)
             elif sindy_params.method == 'tracked':
                 lhs_target = torch.stack(self.state['grad_history'], dim=0)
+                lhs_target = self.interpolate(lhs_target, points_added=points_added, order=1)
                 rhs_mat = Theta
             else:
                 raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong', 'weak', or 'tracked'.")
@@ -687,7 +795,7 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
                                                        poly_order=sindy_params.poly_order,
                                                        include_bias=sindy_params.include_bias)
             Theta = library(mode_coeffs.T)
-            dt_sindy = self.backup_optimizer.param_groups[0]['lr']
+            dt_sindy = self.param_groups[0]['lr']
             t_span = torch.arange(x.shape[0]) * dt_sindy
 
             if sindy_params.method == 'strong':
@@ -695,6 +803,12 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
             elif sindy_params.method == 'weak':
                 lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
                                                                          test_func_params=sindy_params.test_func_params)
+            elif sindy_params.method == 'tracked':
+                grad_hist = torch.stack(self.state['grad_history'], dim=0)
+                grad_hist = self.interpolate(grad_hist, points_added=points_added, order=1)
+                # lhs_target = (U_svd.T @ grad_hist.T).T
+                lhs_target = grad_hist @ U_svd
+                rhs_mat = Theta
             else:
                 raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
 
@@ -730,14 +844,19 @@ class AdamEulerLearned(BaseAdamEulerLearned):
         eps: Union[float, Tensor] = 1e-8,
         history_size: int = 100,
         retrain_interval: int = 200,
-        sindy_params: Optional[SINDyParams] = None
+        sindy_params: Optional[SINDyParams] = None,
+        subsample_factor: int = 1,
+        points_added: int = 0,
+        debug: bool = False
     ):
-        super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size, sindy_params=sindy_params)
+        super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size,
+                         sindy_params=sindy_params, subsample_factor=subsample_factor,
+                         points_added=points_added, debug=debug)
         if retrain_interval < history_size:
             raise ValueError(f"Retrain interval must be greater than or equal to history size: {retrain_interval}!")
         self.retrain_interval = retrain_interval
 
-    def _reset_model(self) -> bool:
+    def _check_model_reset(self) -> bool:
         """Check if the model should be reset based on the retrain interval."""
         return self.state['epoch'] % self.retrain_interval == 1
 
@@ -753,18 +872,26 @@ class AdamEulerLearnedTR(BaseAdamEulerLearned):
         trust_region_control: TrustRegionControl = TrustRegionControl(),
         gamma_tr_radius: float = None,
         sindy_params: Optional[SINDyParams] = None,
-        use_data_driven_thresh: bool = False
+        subsample_factor: int = 1,
+        use_data_driven_thresh: bool = False,
+        points_added: int = 0,
+        debug: bool = False
     ):
-        super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size, sindy_params=sindy_params)
+        super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size,
+                         sindy_params=sindy_params, subsample_factor=subsample_factor,
+                         points_added=points_added,
+                         debug=debug)
         self.trust_region_control = trust_region_control
         if gamma_tr_radius is None:
-            gamma_tr_radius = lr
+            # If we set it just to the lr, we would check performance on the next step or two.
+            # Give a little more extra default freedom to start.
+            gamma_tr_radius = 10.0*lr
         self.gamma_tr_radius = gamma_tr_radius
 
         self.should_reset = True
         self.use_data_driven_thresh = use_data_driven_thresh
 
-    def _reset_model(self) -> bool:
+    def _check_model_reset(self) -> bool:
         """Check if the model should be reset based on the trust region control."""
         if self.should_reset:
             self.should_reset = False
@@ -790,7 +917,7 @@ class AdamEulerLearnedTR(BaseAdamEulerLearned):
             return flat_grad
         else:
             # We've exceeded the trust region
-            # We'll compare against the true gradient, so return that regardless.
+            # We'll compare against the true gradient, so return that regardless (after we compute it)
             # Still need to figure out how we change TR, and if we scrap the model.
             trc = self.trust_region_control
 
@@ -810,22 +937,31 @@ class AdamEulerLearnedTR(BaseAdamEulerLearned):
 
                 # Use the median cosine similarity as a threshold
                 data_driven_thresh = torch.median(torch.tensor(cosines, dtype=flat_grad.dtype, device=flat_grad.device)).item()
-                data_driven_thresh = max(data_driven_thresh, 0.1) # no negative allowed.
+                data_driven_thresh = max(data_driven_thresh, 0.05) # no negative allowed.
             else:
                 data_driven_thresh = 1.0
 
+            # _get_grad updates the loss evaluation count
             true_grad = self._get_grad(self._gather_flat('params'))
+            if self.debug:
+                print(f"[{self.__class__.__name__}] "
+                      f"Epoch {self.state['epoch']}: Evaluated true gradient")
+
+            # Case 0: both gradients are small.
             if torch.norm(true_grad) < trc.grad_tol * dt and torch.norm(flat_grad) < trc.grad_tol * dt:
                 self.gamma_tr_radius *= 1.25
             else:
                 cos_sim = torch.cosine_similarity(true_grad, flat_grad, dim=0)
+                # Case 1: cos_sim is bad, so reduce the TR radius AND reset the model
                 if cos_sim < trc.cosine_similarity_bad_threshold * data_driven_thresh:
                     self.gamma_tr_radius *= trc.radius_factor_bad
                     self.should_reset = True
+                # Case 2: cos_sim is okay, so reduce the TR radius, but keep the model
                 elif cos_sim < trc.cosine_similarity_good_threshold * data_driven_thresh:
                     # Alternatively for these two, we could interpolate the factor based on the cos sim
                     self.gamma_tr_radius *= trc.radius_factor_okay
                     self.should_reset = False
+                # Case 3: cos_sim is good, so increase the TR radius, and keep the model
                 else:
                     self.gamma_tr_radius *= trc.radius_factor_good
                     self.should_reset = False
