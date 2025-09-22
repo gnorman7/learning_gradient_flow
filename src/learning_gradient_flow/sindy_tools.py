@@ -191,7 +191,7 @@ def assemble_weak_matrices(X_data: torch.Tensor,
         X_data: (n_t, d) matrix of states
         Theta: (n_t, P) matrix of library functions evaluated at X_data
         t_span: (n_t,) vector of time points
-        test_mat_kwargs: kwargs for the basis functions created by `create_test_mats`
+        test_func_params: TestFunctionParams object for the basis functions created by `create_test_mats`
 
     Returns:
         (X_data_dPhi, Theta_Phi):

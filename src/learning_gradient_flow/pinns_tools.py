@@ -216,3 +216,29 @@ class PINNsModel(nn.Module):
 
     def forward(self, big_u: torch.Tensor):
         return self.N_dnn(big_u)
+
+
+class saPINNsModel(PINNsModel):
+    def __init__(self, u_dnn: nn.Module, N_dnn: Callable[[torch.Tensor], torch.Tensor],
+                 N_f: int, ic_bc: bool = True):
+        """
+        Args:
+            u_dnn: computes u(x,t,...)
+            N_dnn: computes N(u, u_x, u_xx)
+        """
+        super().__init__(u_dnn, N_dnn, ic_bc)
+        self.N_f = N_f
+        self.collocation_weights = nn.Parameter(torch.ones(N_f, 1), requires_grad=True)
+
+    def get_residual(self, xt_f: torch.Tensor):
+        # call the parent method to get the residuals
+        residual = super().get_residual(xt_f)
+        # weight the residuals by the collocation weights
+        weighted_residual = self.collocation_weights * residual
+        return weighted_residual
+
+    def invert_col_grads(self):
+        # flips the sign of the grad components on the collocation weights
+        self.collocation_weights.grad *= -1.0
+
+

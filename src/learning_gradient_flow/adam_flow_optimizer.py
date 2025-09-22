@@ -33,7 +33,8 @@ class CustomAdam(VectorBasedOptimizer):
         params: ParamsT,
         lr: Union[float, Tensor] = 1e-3,
         betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
-        eps: Union[float, Tensor] = 1e-8
+        eps: Union[float, Tensor] = 1e-8,
+        amsgrad: bool = False,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -44,22 +45,28 @@ class CustomAdam(VectorBasedOptimizer):
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
 
-        defaults = dict(lr=lr, betas=betas, eps=eps)
+        defaults = dict(lr=lr, betas=betas, eps=eps, amsgrad=amsgrad)
         super().__init__(params, defaults)
         self.state = {'epoch': 0}
         self.state['exp_avg'] = None
         self.state['exp_avg_sq'] = None
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = None
+
 
     def _apply_adam_step(self, flat_params: Tensor, flat_grads: Tensor):
         # Apply the Adam update step
         beta1, beta2 = self.defaults['betas']
         lr = self.defaults['lr']
         eps = self.defaults['eps']
+        amsgrad = self.defaults['amsgrad']
 
         # Initialize optimizer state (moment vectors) if this is the first step
         if self.state.get('exp_avg') is None:  # Use .get for safety, though we init to None
             self.state['exp_avg'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
             self.state['exp_avg_sq'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+            if amsgrad:
+                self.state['max_exp_avg_sq'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
 
         self.state['epoch'] += 1
         step_t = self.state['epoch']
@@ -67,23 +74,33 @@ class CustomAdam(VectorBasedOptimizer):
         # Biased estimates
         exp_avg: Tensor = self.state['exp_avg']
         exp_avg_sq: Tensor = self.state['exp_avg_sq']
+        if amsgrad:
+            max_exp_avg_sq: Tensor = self.state['max_exp_avg_sq']
 
         # Biased estimates
         exp_avg.lerp_(flat_grads, weight=1 - beta1)
         exp_avg_sq.lerp_(torch.square(flat_grads), weight=1 - beta2)
+
+        if amsgrad:
+            max_exp_avg_sq = torch.maximum(max_exp_avg_sq, exp_avg_sq)
 
         # Unbiased estimates
         bias_correction1 = 1 - beta1 ** step_t
         bias_correction2 = 1 - beta2 ** step_t
 
         bias_correction2_sqrt = bias_correction2 ** 0.5
+        if amsgrad:
+            denom = (max_exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+        else:
+            denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
 
         lr_w_mhat_factor = lr / bias_correction1
-        denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
 
         # Update parameters: += lr_w_mhat_factor * exp_avg / denom
         flat_params.addcdiv_(exp_avg, denom, value=-lr_w_mhat_factor)
         self._set_params_from_flat(flat_params)
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = max_exp_avg_sq
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
         if closure is not None:
@@ -476,7 +493,8 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
         sindy_params: Optional[SINDyParams] = None,
         subsample_factor: int = 1,
         points_added: int = 0,
-        debug: bool = False
+        debug: bool = False,
+        upgrade_momentum_with_model: bool = True
     ):
         if not lr > 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -501,6 +519,7 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
         self.loss = None
         self.debug = debug
         self.points_added = points_added
+        self.upgrade_momentum_with_model = upgrade_momentum_with_model
 
         if sindy_params is None:
             sindy_params = learning_gradient_flow.sindy_tools.SINDyParams()
@@ -626,7 +645,7 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
 
             # Now update the parameters using the updated momentum and variance
             d_params_dt = -unbiased_momentum / (unbiased_variance.sqrt() + eps)
-            flat_params += d_params_dt * dt
+            flat_params = flat_params + d_params_dt * dt
 
             if same_time:
                 momentum = self.expanded_state[:, 1] + dt * d_momentum_dt
@@ -667,7 +686,7 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
 
             # Now update the parameters using the updated momentum and variance
             d_params_dt = -unbiased_momentum / (unbiased_variance.sqrt() + eps)
-            flat_params += d_params_dt * sub_dt
+            flat_params = flat_params + d_params_dt * sub_dt
 
             if same_time:
                 momentum = self.expanded_state[:, 1] + sub_dt * d_momentum_dt
@@ -678,9 +697,10 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
                 # flat_grad = self._check_grad_alignment(flat_params, flat_grad, dt)
 
         self.state['func_evals'] += self.evals_in_step[0]
-        self.expanded_state = torch.stack(
-            [flat_params, momentum, variance], dim=1
-        )
+        if self.upgrade_momentum_with_model:
+            self.expanded_state = torch.stack(
+                [flat_params, momentum, variance], dim=1
+            )
         self._set_params_from_flat(flat_params)
 
         self.state['epoch'] += 1
@@ -847,11 +867,13 @@ class AdamEulerLearned(BaseAdamEulerLearned):
         sindy_params: Optional[SINDyParams] = None,
         subsample_factor: int = 1,
         points_added: int = 0,
-        debug: bool = False
+        debug: bool = False,
+        upgrade_momentum_with_model: bool = True
     ):
         super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size,
                          sindy_params=sindy_params, subsample_factor=subsample_factor,
-                         points_added=points_added, debug=debug)
+                         points_added=points_added, debug=debug,
+                         upgrade_momentum_with_model=upgrade_momentum_with_model)
         if retrain_interval < history_size:
             raise ValueError(f"Retrain interval must be greater than or equal to history size: {retrain_interval}!")
         self.retrain_interval = retrain_interval
@@ -875,12 +897,13 @@ class AdamEulerLearnedTR(BaseAdamEulerLearned):
         subsample_factor: int = 1,
         use_data_driven_thresh: bool = False,
         points_added: int = 0,
-        debug: bool = False
+        debug: bool = False,
+        upgrade_momentum_with_model: bool = True
     ):
         super().__init__(params, lr=lr, betas=betas, eps=eps, history_size=history_size,
                          sindy_params=sindy_params, subsample_factor=subsample_factor,
                          points_added=points_added,
-                         debug=debug)
+                         debug=debug, upgrade_momentum_with_model=upgrade_momentum_with_model)
         self.trust_region_control = trust_region_control
         if gamma_tr_radius is None:
             # If we set it just to the lr, we would check performance on the next step or two.
@@ -968,4 +991,292 @@ class AdamEulerLearnedTR(BaseAdamEulerLearned):
             self.gamma_tr_radius = min(self.gamma_tr_radius, trc.max_radius)
 
             return true_grad
+
+
+class AppendixAdam(VectorBasedOptimizer):
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: Union[float, Tensor] = 1e-3,
+        betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
+        eps: Union[float, Tensor] = 1e-8,
+        amsgrad: bool = False
+    ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+
+        defaults = dict(lr=lr, betas=betas, eps=eps, amsgrad=amsgrad)
+        super().__init__(params, defaults)
+        self.state = {'epoch': 0}
+        self.state['exp_avg'] = None
+        self.state['exp_avg_sq'] = None
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = None
+        self.state['func_evals'] = 0
+
+    def step(self, closure: Optional[Callable[[], float]] = None):
+        flat_params = self._gather_flat('params')
+
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        grads = self._gather_flat('grads')
+        self.state['func_evals'] += 1
+
+        beta1, beta2 = self.defaults['betas']
+        lr = self.defaults['lr']
+        eps = self.defaults['eps']
+        amsgrad = self.defaults['amsgrad']
+
+        # Initialize optimizer state (moment vectors) if this is the first step
+        if self.state.get('exp_avg') is None:  # Use .get for safety, though we init to None
+            self.state['exp_avg'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+            self.state['exp_avg_sq'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+            if amsgrad:
+                self.state['max_exp_avg_sq'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+
+        # forward Euler step first
+        # Biased estimates
+        exp_avg: Tensor = self.state['exp_avg']
+        exp_avg_sq: Tensor = self.state['exp_avg_sq']
+        if amsgrad:
+            max_exp_avg_sq: Tensor = self.state['max_exp_avg_sq']
+
+        dmdt_eta = (1 - beta1) * (grads - exp_avg)
+        dvdt_eta = (1 - beta2) * (grads ** 2 - exp_avg_sq)
+
+        # now parameter update, we already multiplied by dt.
+        exp_avg = exp_avg + dmdt_eta
+        exp_avg_sq = exp_avg_sq + dvdt_eta
+
+        if amsgrad:
+            max_exp_avg_sq = torch.maximum(max_exp_avg_sq, exp_avg_sq)
+
+        self.state['epoch'] += 1
+        step_t = self.state['epoch']
+        unbiased_exp_avg = exp_avg / (1 - beta1 ** step_t)
+        if amsgrad:
+            unbiased_exp_avg_sq = max_exp_avg_sq / (1 - beta2 ** step_t)
+        else:
+            unbiased_exp_avg_sq = exp_avg_sq / (1 - beta2 ** step_t)
+
+        dparams_dt = -unbiased_exp_avg / (unbiased_exp_avg_sq.sqrt() + eps)
+        flat_params = flat_params + lr * dparams_dt
+
+        self._set_params_from_flat(flat_params)
+        self.state['exp_avg'] = exp_avg
+        self.state['exp_avg_sq'] = exp_avg_sq
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = max_exp_avg_sq
+
+        if closure is not None:
+            return loss
+
+
+class AppendixAdamLearned(VectorBasedOptimizer):
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: Union[float, Tensor] = 1e-3,
+        betas: tuple[Union[float, Tensor], Union[float, Tensor]] = (0.9, 0.999),
+        eps: Union[float, Tensor] = 1e-8,
+        amsgrad: bool = False,
+        history_size: int = 100,
+        retrain_interval: int = 200,
+        sindy_params: Optional[SINDyParams] = None,
+    ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+
+        defaults = dict(lr=lr, betas=betas, eps=eps, amsgrad=amsgrad,
+                        history_size=history_size, retrain_interval=retrain_interval)
+        super().__init__(params, defaults)
+        self.state = {'epoch': 0}
+        self.state['exp_avg'] = None
+        self.state['exp_avg_sq'] = None
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = None
+        self.state['history'] = []
+        self.state['grad_history'] = []
+        self.state['func_evals'] = 0
+
+        if sindy_params is None:
+            sindy_params = learning_gradient_flow.sindy_tools.SINDyParams()
+            sindy_params.method = 'tracked'
+        elif sindy_params.method != 'tracked':
+            warnings.warn(f"SINDy method {sindy_params.method} is not 'tracked'. Using 'tracked' instead.")
+            sindy_params.method = 'tracked'
+        self.sindy_params = sindy_params
+
+    def _get_grad(self, flat_params: Tensor) -> Tensor:
+        with torch.enable_grad():
+            self._set_params_from_flat(flat_params)
+
+
+    def step(self, closure: Optional[Callable[[], float]] = None):
+        flat_params = self._gather_flat('params')
+
+        # We do evaluate the loss on every step, but don't use any info in some cases.
+        # In practice, we should group this step with the later if/else that uses the model or not.
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        beta1, beta2 = self.defaults['betas']
+        lr = self.defaults['lr']
+        eps = self.defaults['eps']
+        amsgrad = self.defaults['amsgrad']
+        history_size = self.defaults['history_size']
+        retrain_interval = self.defaults['retrain_interval']
+
+        # Check model reset (this is called on epoch 0)
+        if self.state['epoch'] % retrain_interval == 0:
+            self.state['history'] = []
+            self.state['grad_history'] = []
+            self.dynamics = None
+
+        if len(self.state['history']) < history_size:
+            grads = self._gather_flat('grads')
+            self.state['history'].append(flat_params)
+            self.state['grad_history'].append(grads)
+            self.state['func_evals'] += 1
+        else:
+            if self.dynamics is None:
+                pred = self.build_sindy_model(sindy_params=self.sindy_params)
+                self.dynamics = lambda y: pred(y)
+            grads = self.dynamics(flat_params)
+
+        # Initialize optimizer state (moment vectors) if this is the first step
+        if self.state.get('exp_avg') is None:  # Use .get for safety, though we init to None
+            self.state['exp_avg'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+            self.state['exp_avg_sq'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+            if amsgrad:
+                self.state['max_exp_avg_sq'] = torch.zeros_like(flat_params, memory_format=torch.preserve_format)
+
+        # forward Euler step first
+        # Biased estimates
+        exp_avg: Tensor = self.state['exp_avg']
+        exp_avg_sq: Tensor = self.state['exp_avg_sq']
+        if amsgrad:
+            max_exp_avg_sq: Tensor = self.state['max_exp_avg_sq']
+
+        dmdt_eta = (1 - beta1) * (grads - exp_avg)
+        dvdt_eta = (1 - beta2) * (grads ** 2 - exp_avg_sq)
+
+        # now parameter update, we already multiplied by dt.
+        exp_avg = exp_avg + dmdt_eta
+        exp_avg_sq = exp_avg_sq + dvdt_eta
+
+        if amsgrad:
+            max_exp_avg_sq = torch.maximum(max_exp_avg_sq, exp_avg_sq)
+
+        self.state['epoch'] += 1
+        step_t = self.state['epoch']
+        unbiased_exp_avg = exp_avg / (1 - beta1 ** step_t)
+        if amsgrad:
+            unbiased_exp_avg_sq = max_exp_avg_sq / (1 - beta2 ** step_t)
+        else:
+            unbiased_exp_avg_sq = exp_avg_sq / (1 - beta2 ** step_t)
+
+        dparams_dt = -unbiased_exp_avg / (unbiased_exp_avg_sq.sqrt() + eps)
+
+        flat_params = flat_params + lr * dparams_dt
+        self._set_params_from_flat(flat_params)
+        self.state['exp_avg'] = exp_avg
+        self.state['exp_avg_sq'] = exp_avg_sq
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = max_exp_avg_sq
+
+        if closure is not None:
+            return loss
+
+    def build_sindy_model(self, sindy_params: sindy_tools.SINDyParams) -> Callable[[Tensor], Tensor]:
+        x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
+        dt_sindy = self.defaults['lr']
+        t_span = torch.arange(x.shape[0]) * dt_sindy
+
+        if sindy_params.truncation_rank is None:
+            d = x.shape[1]
+            library = sindy_tools.create_sindy_library(input_dim=d,
+                                                       poly_order=sindy_params.poly_order,
+                                                       include_bias=sindy_params.include_bias)
+            Theta = library(x)
+            if sindy_params.method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
+            elif sindy_params.method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
+                                                                         test_func_params=sindy_params.test_func_params)
+            elif sindy_params.method == 'tracked':
+                lhs_target = torch.stack(self.state['grad_history'], dim=0)
+                rhs_mat = Theta
+            else:
+                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong', 'weak', or 'tracked'.")
+
+            Xi = sindy_params.solver_fn(rhs_mat, lhs_target, sindy_params.solver_params)
+            pred = sindy_tools.create_predictor(Xi, library)
+        else:
+            truncation_rank = sindy_params.truncation_rank
+            # Build SINDy model in SVD modes.
+            # Note, this is different from MATLAB, as it returns Vh or V.T, not V
+            U_full_svd, s_full_svd, Vh_full_svd = torch.linalg.svd(x.T, full_matrices=False)
+            U_svd = U_full_svd[:, :truncation_rank]
+            s_svd = s_full_svd[:truncation_rank]
+            Vh_svd = Vh_full_svd[:truncation_rank, :]
+            # change training data (x) to be in terms of mode coefficients
+            mode_coeffs = torch.diag(s_svd) @ Vh_svd
+            # now, we can build the library on the mode coefficients
+            library = sindy_tools.create_sindy_library(input_dim=truncation_rank,
+                                                       poly_order=sindy_params.poly_order,
+                                                       include_bias=sindy_params.include_bias)
+            Theta = library(mode_coeffs.T)
+
+            if sindy_params.method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span)
+            elif sindy_params.method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
+                                                                         test_func_params=sindy_params.test_func_params)
+            elif sindy_params.method == 'tracked':
+                grad_hist = torch.stack(self.state['grad_history'], dim=0)
+                # lhs_target = (U_svd.T @ grad_hist.T).T
+                lhs_target = grad_hist @ U_svd
+                rhs_mat = Theta
+            else:
+                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
+
+            # General solution method for solving the linear system.
+            # This should take the rhs_mat, lhs_target, and params object, returning the solution Xi
+            Xi = sindy_params.solver_fn(rhs_mat, lhs_target, sindy_params.solver_params)
+
+            mode_pred = sindy_tools.create_predictor(Xi, library)
+            # now, we need to create a predictor that takes in the full state and returns the state derivs,
+            # not just on mode coeffs
+
+            def pred(y: Tensor) -> Tensor:
+                # y is d,1
+                # compute the mode coefficients associated with y. We can do this through a matmul
+                cur_mode_coeffs = U_svd.T @ y
+                # generate predictions on the mode coefficients
+                mode_pred_coeffs = mode_pred(cur_mode_coeffs)
+                # now, we need to convert the mode predictions back to the full state space
+                dydt = U_svd @ mode_pred_coeffs
+                return dydt
+
+        # dot(y) = g(y), this is g(y).
+        # dot(y) = f(t, y) = g(y), f is dynamics
+        return pred
+
+
+
 
