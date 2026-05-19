@@ -37,5 +37,46 @@ pip install -e .
 - `notebooks/`: Jupyter Notebooks
 - `requirements.txt`: Python package requirements (TODO)
 
+
 ## Usage
 
+For a quick check, start with the small two-variable problem:
+
+```bash
+python examples/ex1_2vars.py
+```
+
+Other paper examples include the Newton, deep-learning, and scattering examples:
+
+```bash
+python examples/ex3_newton.py
+python examples/ex4_scattering.py
+python examples/ex5_deep.py
+```
+
+The scattering example uses CALFEM for Python (`calfem-python`) and its
+Gmsh-based meshing workflow, so it may need a little additional local setup:
+
+```bash
+pip install -e ".[examples]"
+```
+
+
+The main optimizer classes are:
+
+- `learning_gradient_flow.gradient_flow_optimizer.LGFGradientFlow`: LGF optimizer
+  for learning gradient-flow dynamics from an optimization trajectory.
+- `learning_gradient_flow.adam_flow_optimizer.BaseAdam`: baseline Adam variant
+  used for comparisons in the examples.
+- `learning_gradient_flow.adam_flow_optimizer.LGFAdam`: Adam-style LGF optimizer
+  that learns a SINDy surrogate for gradients.
+
+SINDy library construction, weak/strong form matrix assembly, and sparse
+regression utilities are in `learning_gradient_flow.sindy_tools`.
+
+To run tests, install the optional development dependency first:
+
+```bash
+pip install -e ".[dev]"
+python -m pytest
+```

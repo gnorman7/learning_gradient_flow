@@ -16,6 +16,10 @@ dependencies = [
 dev = [
   "pytest",
 ]
+examples = [
+  "matplotlib",
+  "calfem-python",
+]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
