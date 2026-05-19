@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+from typing import Callable, Optional, Union
+import math
 import warnings
 from typing import Optional, Callable, Dict, Any, Union
 from dataclasses import dataclass, asdict
@@ -777,7 +779,8 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
             d = x.shape[1]
             library = sindy_tools.create_sindy_library(input_dim=d,
                                                        poly_order=sindy_params.poly_order,
-                                                       include_bias=sindy_params.include_bias)
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
             Theta = library(x)
             dt_sindy = self.param_groups[0]['lr']
             # t_span = torch.arange(n_hist) * dt_sindy
@@ -813,7 +816,8 @@ class BaseAdamEulerLearned(VectorBasedOptimizer):
             # now, we can build the library on the mode coefficients
             library = sindy_tools.create_sindy_library(input_dim=truncation_rank,
                                                        poly_order=sindy_params.poly_order,
-                                                       include_bias=sindy_params.include_bias)
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
             Theta = library(mode_coeffs.T)
             dt_sindy = self.param_groups[0]['lr']
             t_span = torch.arange(x.shape[0]) * dt_sindy
@@ -1211,7 +1215,8 @@ class AppendixAdamLearned(VectorBasedOptimizer):
             d = x.shape[1]
             library = sindy_tools.create_sindy_library(input_dim=d,
                                                        poly_order=sindy_params.poly_order,
-                                                       include_bias=sindy_params.include_bias)
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
             Theta = library(x)
             if sindy_params.method == 'strong':
                 lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
@@ -1239,7 +1244,8 @@ class AppendixAdamLearned(VectorBasedOptimizer):
             # now, we can build the library on the mode coefficients
             library = sindy_tools.create_sindy_library(input_dim=truncation_rank,
                                                        poly_order=sindy_params.poly_order,
-                                                       include_bias=sindy_params.include_bias)
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
             Theta = library(mode_coeffs.T)
 
             if sindy_params.method == 'strong':
@@ -1277,6 +1283,614 @@ class AppendixAdamLearned(VectorBasedOptimizer):
         # dot(y) = f(t, y) = g(y), f is dynamics
         return pred
 
+
+# Assumes you already have this somewhere in the project
+# from torchdiffeq import odeint as torchdiffeq_odeint
+# and VectorBasedOptimizer provides:
+#   _gather_flat("params"|"grads"), _set_params_from_flat(flat), self._device, etc.
+
+
+class AppendixAdamContLearned(VectorBasedOptimizer):
+    """
+    Continuous-time (ODE-solved) version of the learned-gradient Adam:
+      - Warm-up: run discrete Adam with true gradients and collect (a, grad) history
+      - Learn: fit SINDy for grad ~= f_sindy(a)
+      - Deploy: integrate the Adam ODE in (a, m, v) over [t_global, t_global + dt]
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        # "eta" in the paper (nominal Adam step size used in bias correction + moment ODE scaling)
+        lr: float = 1e-3,
+        # Outer integration horizon per optimizer step
+        dt: Optional[float] = None,
+        betas=(0.9, 0.999),
+        eps: float = 1e-8,
+        amsgrad: bool = False,
+        history_size: int = 100,
+        retrain_interval: int = 200,
+        ode_solver_options: Optional[dict] = None,
+        sindy_params=None,
+        skip_unused_evals: bool = False,
+    ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid eta: {lr}")
+        if dt is None:
+            dt = float(lr)
+        if not 0.0 < dt:
+            raise ValueError(f"Invalid dt: {dt}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+
+        defaults = dict(
+            lr=float(lr),
+            dt=float(dt),
+            betas=(float(betas[0]), float(betas[1])),
+            eps=float(eps),
+            amsgrad=bool(amsgrad),
+            history_size=int(history_size),
+            retrain_interval=int(retrain_interval),
+            ode_solver_options=ode_solver_options or {},
+        )
+        super().__init__(params, defaults)
+
+        self.state = {}
+        self.state["epoch"] = 0                 # discrete outer-step count
+        self.state["t_global"] = 0.0            # absolute time for bias correction
+        self.state["func_evals"] = 0
+        self.state["skip_unused_evals"] = skip_unused_evals
+
+        # Adam states stored in flat form
+        self.state["exp_avg"] = None
+        self.state["exp_avg_sq"] = None
+        self.state["max_exp_avg_sq"] = None     # if amsgrad
+
+        # data buffers
+        self.state["history"] = []
+        self.state["grad_history"] = []
+
+        # learned gradient surrogate
+        self.dynamics = None
+
+        # SINDy params
+        if sindy_params is None:
+            sindy_params = learning_gradient_flow.sindy_tools.SINDyParams()
+            sindy_params.method = "tracked"
+        elif sindy_params.method != "tracked":
+            warnings.warn(f"SINDy method {sindy_params.method} is not 'tracked'. Using 'tracked' instead.")
+            sindy_params.method = "tracked"
+        self.sindy_params = sindy_params
+
+    # ----------------------------
+    # Helpers: pack/unpack ODE state
+    # ----------------------------
+    def _pack_state(self, a: Tensor, m: Tensor, v: Tensor, vmax: Optional[Tensor] = None) -> Tensor:
+        if vmax is None:
+            return torch.cat([a, m, v], dim=0)
+        return torch.cat([a, m, v, vmax], dim=0)
+
+    def _unpack_state(self, y: Tensor, d: int, amsgrad: bool):
+        a = y[:d]
+        m = y[d:2 * d]
+        v = y[2 * d:3 * d]
+        vmax = None
+        if amsgrad:
+            vmax = y[3 * d:4 * d]
+        return a, m, v, vmax
+
+    # ----------------------------
+    # Main step
+    # ----------------------------
+    def step(self, closure: Callable[[], Tensor]) -> Optional[Tensor]:
+        closure = torch.enable_grad()(closure)
+
+        group = self.param_groups[0]
+        eta: float = group["lr"]
+        dt: float = group["dt"]
+        beta1, beta2 = group["betas"]
+        eps: float = group["eps"]
+        amsgrad: bool = group["amsgrad"]
+        history_size: int = group["history_size"]
+        retrain_interval: int = group["retrain_interval"]
+        ode_options: dict = group["ode_solver_options"]
+
+        # Periodic reset of data/surrogate (intended)
+        if self.state["epoch"] % retrain_interval == 0:
+            self.state["history"] = []
+            self.state["grad_history"] = []
+            self.dynamics = None
+
+        skip_unused_evals = self.state["skip_unused_evals"]
+        needs_true_eval = (len(self.state["history"]) < history_size) or (not skip_unused_evals)
+
+        if needs_true_eval:
+            loss = closure()
+        else:
+            loss = None
+
+        # Pull flat params + grads; store safely
+        a = self._gather_flat("params").detach()
+        g = self._gather_flat("grads").detach()
+        if needs_true_eval:
+            self.state["func_evals"] += 1  # counts true gradient evals (if closure computed grads)
+
+        # Initialize Adam moment states if needed
+        if self.state["exp_avg"] is None:
+            self.state["exp_avg"] = torch.zeros_like(a, memory_format=torch.preserve_format)
+            self.state["exp_avg_sq"] = torch.zeros_like(a, memory_format=torch.preserve_format)
+            if amsgrad:
+                self.state["max_exp_avg_sq"] = torch.zeros_like(a, memory_format=torch.preserve_format)
+
+        # ----------------------------
+        # Warm-up / data phase: discrete Adam with true gradients
+        # ----------------------------
+        if len(self.state["history"]) < history_size:
+            # Record snapshots defensively
+            self.state["history"].append(a.clone().detach())
+            self.state["grad_history"].append(g.clone().detach())
+
+            # One discrete Adam step (same as your current AppendixAdamLearned ordering)
+            m = self.state["exp_avg"]
+            v = self.state["exp_avg_sq"]
+            m = m + (1.0 - beta1) * (g - m)
+            v = v + (1.0 - beta2) * (g * g - v)
+
+            if amsgrad:
+                vmax = self.state["max_exp_avg_sq"]
+                vmax = torch.maximum(vmax, v)
+            else:
+                vmax = None
+
+            # increment epoch/time (bias correction uses epoch count / absolute time)
+            self.state["epoch"] += 1
+            self.state["t_global"] += dt
+            step_t = self.state["epoch"]
+
+            mhat = m / (1.0 - (beta1 ** step_t))
+            if amsgrad:
+                vhat = vmax / (1.0 - (beta2 ** step_t))
+            else:
+                vhat = v / (1.0 - (beta2 ** step_t))
+
+            dadt = -mhat / (vhat.sqrt() + eps)
+            # Discrete update uses "eta" as the step size in the paper; keep consistent with your derivation
+            a_next = a + eta * dadt
+            self._set_params_from_flat(a_next)
+
+            # Save updated moments
+            self.state["exp_avg"] = m
+            self.state["exp_avg_sq"] = v
+            if amsgrad:
+                self.state["max_exp_avg_sq"] = vmax
+
+            return loss
+
+        # ----------------------------
+        # Learned / deployment phase: integrate Adam ODE in (a,m,v)
+        # ----------------------------
+        if self.dynamics is None:
+            pred = self.build_sindy_model(sindy_params=self.sindy_params)
+            # keep the name "dynamics" even though it predicts gradients
+            self.dynamics = lambda y: pred(y)
+
+        d = a.numel()
+        m0 = self.state["exp_avg"].detach()
+        v0 = self.state["exp_avg_sq"].detach()
+        if amsgrad:
+            vmax0 = self.state["max_exp_avg_sq"].detach()
+        else:
+            vmax0 = None
+
+        y0 = self._pack_state(a, m0, v0, vmax0)
+
+        # Build RHS for odeint; note we must use absolute time for bias correction
+        logb1 = math.log(beta1)
+        logb2 = math.log(beta2)
+
+        def rhs(t: Tensor, y: Tensor) -> Tensor:
+            a_t, m_t, v_t, vmax_t = self._unpack_state(y, d, amsgrad)
+
+            # predicted gradient
+            g_t = self.dynamics(a_t)
+
+            # moment ODEs
+            dm = (1.0 / eta) * (1.0 - beta1) * (g_t - m_t)
+            dv = (1.0 / eta) * (1.0 - beta2) * (g_t * g_t - v_t)
+
+            # bias correction factors as continuous-time analog
+            # beta^{t/eta} = exp(log(beta) * t/eta)
+            b1_pow = torch.exp((t / eta) * logb1)
+            b2_pow = torch.exp((t / eta) * logb2)
+            denom1 = (1.0 - b1_pow).clamp_min(1e-16)
+            denom2 = (1.0 - b2_pow).clamp_min(1e-16)
+
+            mhat = m_t / denom1
+
+            if amsgrad:
+                # Practical compromise: treat vmax as constant over the interval for the denominator,
+                # then project it at the end of the outer step.
+                vhat = vmax_t / denom2
+            else:
+                vhat = v_t / denom2
+
+            da = -mhat / (vhat.sqrt() + eps)
+
+            if amsgrad:
+                # Keep vmax state unchanged during integration; project after solve.
+                dvmax = torch.zeros_like(v_t)
+                return self._pack_state(da, dm, dv, dvmax)
+            else:
+                return self._pack_state(da, dm, dv)
+
+        # Integrate over absolute time interval
+        t0 = torch.tensor(self.state["t_global"], device=a.device, dtype=a.dtype)
+        t1 = torch.tensor(self.state["t_global"] + dt, device=a.device, dtype=a.dtype)
+        t_span = torch.stack([t0, t1], dim=0)
+
+        with torch.no_grad():
+            y_traj = torchdiffeq_odeint(rhs, y0, t_span, **ode_options)
+            y_final = y_traj[-1]
+
+        a_f, m_f, v_f, vmax_f = self._unpack_state(y_final, d, amsgrad)
+
+        # AMSGrad projection at boundary (monotone max) if enabled
+        if amsgrad:
+            vmax_proj = torch.maximum(self.state["max_exp_avg_sq"], v_f)
+            self.state["max_exp_avg_sq"] = vmax_proj
+        self.state["exp_avg"] = m_f
+        self.state["exp_avg_sq"] = v_f
+
+        # Apply final parameters
+        self._set_params_from_flat(a_f)
+
+        # Advance counters
+        self.state["epoch"] += 1
+        self.state["t_global"] += dt
+
+        if skip_unused_evals:
+            return torch.tensor(-1.0, device=a_f.device, dtype=a_f.dtype)
+        return loss
+
+    # Your existing build_sindy_model can be reused directly.
+    # Two recommended changes for "continuous correctness":
+    #   (i) when using strong/weak methods, ensure t_span uses the true sample spacing (dt or eta),
+    #   (ii) ensure history/grad_history were stored with clone().detach() (done above).
+    def build_sindy_model(self, sindy_params: sindy_tools.SINDyParams) -> Callable[[Tensor], Tensor]:
+        x = torch.stack(self.state['history'], dim=0)  # history_size, num_params
+        dt_sindy = self.defaults['lr']
+        t_span = torch.arange(x.shape[0]) * dt_sindy
+
+        if sindy_params.truncation_rank is None:
+            d = x.shape[1]
+            library = sindy_tools.create_sindy_library(input_dim=d,
+                                                       poly_order=sindy_params.poly_order,
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
+            Theta = library(x)
+            if sindy_params.method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
+            elif sindy_params.method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
+                                                                         test_func_params=sindy_params.test_func_params)
+            elif sindy_params.method == 'tracked':
+                lhs_target = torch.stack(self.state['grad_history'], dim=0)
+                rhs_mat = Theta
+            else:
+                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong', 'weak', or 'tracked'.")
+
+            Xi = sindy_params.solver_fn(rhs_mat, lhs_target, sindy_params.solver_params)
+            pred = sindy_tools.create_predictor(Xi, library)
+        else:
+            truncation_rank = sindy_params.truncation_rank
+            # Build SINDy model in SVD modes.
+            # Note, this is different from MATLAB, as it returns Vh or V.T, not V
+            U_full_svd, s_full_svd, Vh_full_svd = torch.linalg.svd(x.T, full_matrices=False)
+            U_svd = U_full_svd[:, :truncation_rank]
+            s_svd = s_full_svd[:truncation_rank]
+            Vh_svd = Vh_full_svd[:truncation_rank, :]
+            # change training data (x) to be in terms of mode coefficients
+            mode_coeffs = torch.diag(s_svd) @ Vh_svd
+            # now, we can build the library on the mode coefficients
+            library = sindy_tools.create_sindy_library(input_dim=truncation_rank,
+                                                       poly_order=sindy_params.poly_order,
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
+            Theta = library(mode_coeffs.T)
+
+            if sindy_params.method == 'strong':
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span)
+            elif sindy_params.method == 'weak':
+                lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
+                                                                         test_func_params=sindy_params.test_func_params)
+            elif sindy_params.method == 'tracked':
+                grad_hist = torch.stack(self.state['grad_history'], dim=0)
+                # lhs_target = (U_svd.T @ grad_hist.T).T
+                lhs_target = grad_hist @ U_svd
+                rhs_mat = Theta
+            else:
+                raise ValueError(f"Method {sindy_params.method} not recognized. Use 'strong' or 'weak'.")
+
+            # General solution method for solving the linear system.
+            # This should take the rhs_mat, lhs_target, and params object, returning the solution Xi
+            Xi = sindy_params.solver_fn(rhs_mat, lhs_target, sindy_params.solver_params)
+
+            mode_pred = sindy_tools.create_predictor(Xi, library)
+            # now, we need to create a predictor that takes in the full state and returns the state derivs,
+            # not just on mode coeffs
+
+            def pred(y: Tensor) -> Tensor:
+                # y is d,1
+                # compute the mode coefficients associated with y. We can do this through a matmul
+                cur_mode_coeffs = U_svd.T @ y
+                # generate predictions on the mode coefficients
+                mode_pred_coeffs = mode_pred(cur_mode_coeffs)
+                # now, we need to convert the mode predictions back to the full state space
+                dydt = U_svd @ mode_pred_coeffs
+                return dydt
+
+        # dot(y) = g(y), this is g(y).
+        # dot(y) = f(t, y) = g(y), f is dynamics
+        return pred
+
+class AppendixAdamContLearnedTrustRegion(AppendixAdamContLearned):
+    """
+    Trust-region version of AppendixAdamContLearned:
+      - Warm-up: discrete Adam with true gradients, collect (a, grad) history
+      - Learn: fit SINDy for grad ~= f_sindy(a)
+      - Deploy: integrate Adam ODE, but enforce a trust region against the last true step
+      - Retrain: only when trust-region checks indicate poor alignment
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        lr: float = 1e-3,
+        dt: Optional[float] = None,
+        betas=(0.9, 0.999),
+        eps: float = 1e-8,
+        amsgrad: bool = False,
+        history_size: int = 100,
+        gamma_tr_radius: Optional[float] = None,
+        trust_region_control: Optional[TrustRegionControl] = None,
+        ode_solver_options: Optional[dict] = None,
+        sindy_params=None,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            dt=dt,
+            betas=betas,
+            eps=eps,
+            amsgrad=amsgrad,
+            history_size=history_size,
+            retrain_interval=1,
+            ode_solver_options=ode_solver_options,
+            sindy_params=sindy_params,
+        )
+
+        if gamma_tr_radius is None:
+            gamma_tr_radius = 2.0 * self.param_groups[0]["dt"]
+        if not gamma_tr_radius > 0:
+            raise ValueError(f"Trust-region radius gamma must be positive: {gamma_tr_radius}")
+        if trust_region_control is None:
+            trust_region_control = TrustRegionControl()
+
+        self.state["gamma_tr_radius"] = float(gamma_tr_radius)
+        self.param_groups[0]["trust_region_control"] = trust_region_control
+
+        if "retrain_interval" in self.defaults:
+            self.defaults.pop("retrain_interval", None)
+        if "retrain_interval" in self.param_groups[0]:
+            self.param_groups[0].pop("retrain_interval", None)
+
+    def step(self, closure: Callable[[], Tensor]) -> Optional[Tensor]:
+        closure = torch.enable_grad()(closure)
+
+        group = self.param_groups[0]
+        eta: float = group["lr"]
+        dt: float = group["dt"]
+        beta1, beta2 = group["betas"]
+        eps: float = group["eps"]
+        amsgrad: bool = group["amsgrad"]
+        history_size: int = group["history_size"]
+        ode_options: dict = group["ode_solver_options"]
+        trc: TrustRegionControl = group["trust_region_control"]
+
+        # Evaluate for performance reporting (required behavior)
+        loss = closure()
+
+        # Pull flat params + grads; store safely
+        a = self._gather_flat("params").detach()
+        g = self._gather_flat("grads").detach()
+
+        # Initialize Adam moment states if needed
+        if self.state["exp_avg"] is None:
+            self.state["exp_avg"] = torch.zeros_like(a, memory_format=torch.preserve_format)
+            self.state["exp_avg_sq"] = torch.zeros_like(a, memory_format=torch.preserve_format)
+            if amsgrad:
+                self.state["max_exp_avg_sq"] = torch.zeros_like(a, memory_format=torch.preserve_format)
+
+        # ----------------------------
+        # Warm-up / data phase
+        # ----------------------------
+        if len(self.state["history"]) < history_size:
+            self.state["history"].append(a.clone().detach())
+            self.state["grad_history"].append(g.clone().detach())
+            self.state["func_evals"] += 1
+
+            m = self.state["exp_avg"]
+            v = self.state["exp_avg_sq"]
+            m = m + (1.0 - beta1) * (g - m)
+            v = v + (1.0 - beta2) * (g * g - v)
+
+            if amsgrad:
+                vmax = self.state["max_exp_avg_sq"]
+                vmax = torch.maximum(vmax, v)
+            else:
+                vmax = None
+
+            self.state["epoch"] += 1
+            self.state["t_global"] += dt
+            step_t = self.state["epoch"]
+
+            mhat = m / (1.0 - (beta1 ** step_t))
+            if amsgrad:
+                vhat = vmax / (1.0 - (beta2 ** step_t))
+            else:
+                vhat = v / (1.0 - (beta2 ** step_t))
+
+            dadt = -mhat / (vhat.sqrt() + eps)
+            a_next = a + eta * dadt
+            self._set_params_from_flat(a_next)
+
+            self.state["exp_avg"] = m
+            self.state["exp_avg_sq"] = v
+            if amsgrad:
+                self.state["max_exp_avg_sq"] = vmax
+
+            self.state["y_last_closure"] = a_next.clone().detach()
+            return loss
+
+        # ----------------------------
+        # Learned / deployment phase
+        # ----------------------------
+        if self.dynamics is None:
+            pred = self.build_sindy_model(sindy_params=self.sindy_params)
+            self.dynamics = lambda y: pred(y)
+
+        d = a.numel()
+        m0 = self.state["exp_avg"].detach()
+        v0 = self.state["exp_avg_sq"].detach()
+        if amsgrad:
+            vmax0 = self.state["max_exp_avg_sq"].detach()
+        else:
+            vmax0 = None
+
+        y0 = self._pack_state(a, m0, v0, vmax0)
+
+        logb1 = math.log(beta1)
+        logb2 = math.log(beta2)
+
+        def rhs(t: Tensor, y: Tensor) -> Tensor:
+            a_t, m_t, v_t, vmax_t = self._unpack_state(y, d, amsgrad)
+
+            g_t = self.dynamics(a_t)
+
+            dm = (1.0 / eta) * (1.0 - beta1) * (g_t - m_t)
+            dv = (1.0 / eta) * (1.0 - beta2) * (g_t * g_t - v_t)
+
+            b1_pow = torch.exp((t / eta) * logb1)
+            b2_pow = torch.exp((t / eta) * logb2)
+            denom1 = (1.0 - b1_pow).clamp_min(1e-16)
+            denom2 = (1.0 - b2_pow).clamp_min(1e-16)
+
+            mhat = m_t / denom1
+            if amsgrad:
+                vhat = vmax_t / denom2
+            else:
+                vhat = v_t / denom2
+
+            da = -mhat / (vhat.sqrt() + eps)
+
+            if amsgrad:
+                dvmax = torch.zeros_like(v_t)
+                return self._pack_state(da, dm, dv, dvmax)
+            return self._pack_state(da, dm, dv)
+
+        t0 = torch.tensor(self.state["t_global"], device=a.device, dtype=a.dtype)
+        t1 = torch.tensor(self.state["t_global"] + dt, device=a.device, dtype=a.dtype)
+        t_span = torch.stack([t0, t1], dim=0)
+
+        with torch.no_grad():
+            y_traj = torchdiffeq_odeint(rhs, y0, t_span, **ode_options)
+            y_final = y_traj[-1]
+
+        a_f, m_f, v_f, vmax_f = self._unpack_state(y_final, d, amsgrad)
+
+        if "y_last_closure" not in self.state:
+            self.state["y_last_closure"] = a.clone().detach()
+
+        y_diff = a_f - self.state["y_last_closure"]
+        y_diff_norm = torch.norm(y_diff, p=2)
+        gamma_tr_radius = self.state["gamma_tr_radius"]
+
+        if y_diff_norm <= gamma_tr_radius:
+            if amsgrad:
+                vmax_proj = torch.maximum(self.state["max_exp_avg_sq"], v_f)
+                self.state["max_exp_avg_sq"] = vmax_proj
+            self.state["exp_avg"] = m_f
+            self.state["exp_avg_sq"] = v_f
+
+            self._set_params_from_flat(a_f)
+
+            self.state["epoch"] += 1
+            self.state["t_global"] += dt
+            return loss
+
+        # ----------------------------
+        # Trust region violated: take true discrete Adam step and compare updates
+        # ----------------------------
+        self.state["func_evals"] += 1
+        y_pred_update = a_f - a
+
+        m = self.state["exp_avg"]
+        v = self.state["exp_avg_sq"]
+        m = m + (1.0 - beta1) * (g - m)
+        v = v + (1.0 - beta2) * (g * g - v)
+
+        if amsgrad:
+            vmax = self.state["max_exp_avg_sq"]
+            vmax = torch.maximum(vmax, v)
+        else:
+            vmax = None
+
+        self.state["epoch"] += 1
+        self.state["t_global"] += dt
+        step_t = self.state["epoch"]
+
+        mhat = m / (1.0 - (beta1 ** step_t))
+        if amsgrad:
+            vhat = vmax / (1.0 - (beta2 ** step_t))
+        else:
+            vhat = v / (1.0 - (beta2 ** step_t))
+
+        dadt = -mhat / (vhat.sqrt() + eps)
+        a_after = a + eta * dadt
+        self._set_params_from_flat(a_after)
+
+        self.state["exp_avg"] = m
+        self.state["exp_avg_sq"] = v
+        if amsgrad:
+            self.state["max_exp_avg_sq"] = vmax
+
+        self.state["y_last_closure"] = a_after.clone().detach()
+
+        y_update = a_after - a
+
+        small_update_tol = trc.grad_tol * dt
+        if torch.norm(y_update) < small_update_tol and torch.norm(y_pred_update) < small_update_tol:
+            self.state["gamma_tr_radius"] = gamma_tr_radius * 1.25
+        else:
+            cos_sim = torch.cosine_similarity(y_update, y_pred_update, dim=0)
+            if cos_sim < trc.cosine_similarity_bad_threshold:
+                self.state["gamma_tr_radius"] = gamma_tr_radius * trc.radius_factor_bad
+                self.state["history"] = [a_after.clone().detach()]
+                self.state["grad_history"] = [g.clone().detach()]
+                self.dynamics = None
+            elif cos_sim < trc.cosine_similarity_good_threshold:
+                self.state["gamma_tr_radius"] = gamma_tr_radius * trc.radius_factor_okay
+            else:
+                self.state["gamma_tr_radius"] = gamma_tr_radius * trc.radius_factor_good
+
+        self.state["gamma_tr_radius"] = min(self.state["gamma_tr_radius"], trc.max_radius)
+        return loss
 
 
 

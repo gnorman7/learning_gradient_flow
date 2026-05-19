@@ -241,7 +241,8 @@ class SINDyFlow(VectorBasedOptimizer):
         ode_solver_options: Dict[str, Any] = {},
         history_size: int = 100,
         retrain_interval: int = 200,
-        sindy_params: sindy_tools.SINDyParams = None
+        sindy_params: sindy_tools.SINDyParams = None,
+        skip_unused_evals: bool = False,
     ):
         if torchdiffeq_odeint is None:
             raise ImportError(
@@ -266,6 +267,7 @@ class SINDyFlow(VectorBasedOptimizer):
         self.state['history'] = [] # tracks the parameter history
         self.state['history_count'] = 0
         self.state['epoch'] = 0
+        self.state['skip_unused_evals'] = skip_unused_evals
         self.backup_optimizer = backup_optimizer
         self.sindy_params = sindy_params
 
@@ -294,7 +296,9 @@ class SINDyFlow(VectorBasedOptimizer):
             self.state['epoch'] += 1
             return loss
         else:
-            orig_loss = closure()
+            skip_unused_evals = self.state['skip_unused_evals']
+            if not skip_unused_evals:
+                orig_loss = closure()
             # self.state['func_evals'] += 1
 
             # build sindy model if it doesn't already exist
@@ -323,7 +327,10 @@ class SINDyFlow(VectorBasedOptimizer):
             self._set_params_from_flat(y_final)
 
             self.state['epoch'] += 1
-            return orig_loss
+            if skip_unused_evals:
+                return torch.tensor(-1.0)
+            else:
+                return orig_loss
 
     def get_sindy_mats(self, sindy_params: sindy_tools.SINDyParams) -> tuple[Tensor, Tensor]:
         """Returns lhs_target and rhs_mat"""
@@ -331,12 +338,14 @@ class SINDyFlow(VectorBasedOptimizer):
         d = x.shape[1]
         library = sindy_tools.create_sindy_library(input_dim=d,
                                                    poly_order=sindy_params.poly_order,
-                                                   include_bias=sindy_params.include_bias)
+                                                   include_bias=sindy_params.include_bias,
+                                                   use_ortho=sindy_params.use_ortho)
         Theta = library(x)
         dt_sindy = self.backup_optimizer.param_groups[0]['lr']
         t_span = torch.arange(x.shape[0]) * dt_sindy
         if sindy_params.method == 'strong':
-            lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span)
+            lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(x, Theta, t_span,
+                                                                       fd_order=sindy_params.fd_order)
         elif sindy_params.method == 'weak':
             lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(x, Theta, t_span,
                                                                         test_func_params=sindy_params.test_func_params)
@@ -364,7 +373,7 @@ class SINDyFlow(VectorBasedOptimizer):
         # each entry of self.state['history'] is a tensor of shape (num_params,)
 
         if sindy_params.truncation_rank is None:
-            rhs_mat, lhs_target, library = self.get_sindy_mats(sindy_params)
+            lhs_target, rhs_mat, library = self.get_sindy_mats(sindy_params)
 
             # General solution method for solving the linear system.
             # This should take the rhs_mat, lhs_target, and params object, returning the solution Xi
@@ -385,13 +394,15 @@ class SINDyFlow(VectorBasedOptimizer):
             # now, we can build the library on the mode coefficients
             library = sindy_tools.create_sindy_library(input_dim=truncation_rank,
                                                        poly_order=sindy_params.poly_order,
-                                                       include_bias=sindy_params.include_bias)
+                                                       include_bias=sindy_params.include_bias,
+                                                       use_ortho=sindy_params.use_ortho)
             Theta = library(mode_coeffs.T)
             dt_sindy = self.backup_optimizer.param_groups[0]['lr']
             t_span = torch.arange(x.shape[0]) * dt_sindy
 
             if sindy_params.method == 'strong':
-                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span)
+                lhs_target, rhs_mat = sindy_tools.assemble_strong_matrices(mode_coeffs.T, Theta, t_span,
+                                                                           fd_order=sindy_params.fd_order)
             elif sindy_params.method == 'weak':
                 lhs_target, rhs_mat = sindy_tools.assemble_weak_matrices(mode_coeffs.T, Theta, t_span,
                                                                          test_func_params=sindy_params.test_func_params)

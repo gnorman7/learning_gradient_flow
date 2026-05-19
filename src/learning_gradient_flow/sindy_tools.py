@@ -1,12 +1,55 @@
+from __future__ import annotations
 from typing import Optional, Any, Tuple, Optional, Protocol
 from dataclasses import dataclass
+import warnings
 import torch
 import torch.nn as nn
 
 #%% Libraries
+def build_orthonormal_basis(
+    Theta: torch.Tensor,
+    rcond: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build an orthonormal basis for the columns of Theta.
+
+    Returns:
+        Theta_ortho: (n_samples, r) orthonormalized features
+        transform: (n_features, r) matrix such that Theta_ortho = Theta @ transform
+    """
+    if Theta.ndim != 2:
+        raise ValueError(f"Theta must be 2D (n_samples, n_features). Got shape {Theta.shape}.")
+    n_samples, n_features = Theta.shape
+    if n_samples == 0 or n_features == 0:
+        return Theta.new_zeros((n_samples, 0)), Theta.new_zeros((n_features, 0))
+
+    U, S, Vh = torch.linalg.svd(Theta, full_matrices=False)
+    if S.numel() == 0:
+        return Theta.new_zeros((n_samples, 0)), Theta.new_zeros((n_features, 0))
+
+    tol = rcond * S.max()
+    keep = S > tol
+    if not torch.any(keep):
+        warnings.warn("Orthonormalization removed all features; using identity transform instead.")
+        transform = torch.eye(n_features, device=Theta.device, dtype=Theta.dtype)
+        return Theta, transform
+
+    if keep.sum() < n_features:
+        warnings.warn(
+            f"Orthonormalization reduced feature count from {n_features} to {keep.sum().item()}."
+        )
+
+    V = Vh.transpose(-2, -1)  # (n_features, r_full)
+    transform = V[:, keep] * (1.0 / S[keep])
+    Theta_ortho = Theta @ transform
+    return Theta_ortho, transform
+
+
 def create_sindy_library(input_dim: int,
                        poly_order: int = 2,
-                       include_bias: bool = True) -> nn.Module:
+                       include_bias: bool = True,
+                       use_ortho: bool = False,
+                       ortho_rcond: float = 1e-12) -> nn.Module:
     """
     Constructs a SINDy-style library evaluator as a PyTorch module.
 
@@ -14,16 +57,22 @@ def create_sindy_library(input_dim: int,
         input_dim (int): Dimension of input a(t).
         poly_order (int): Maximum polynomial order for library.
         include_bias (bool): Whether to include a constant term.
+        use_ortho (bool): If True, orthonormalize library features on first call and reuse.
+        ortho_rcond (float): Relative cutoff for singular values in orthonormalization.
 
     Returns:
         library (nn.Module): Module that maps x -> Theta(x) of shape (..., P).
     """
     class SINDyLibrary(nn.Module):
-        def __init__(self, input_dim, poly_order, include_bias):
+        def __init__(self, input_dim, poly_order, include_bias, use_ortho, ortho_rcond):
             super().__init__()
             self.input_dim = input_dim
             self.poly_order = poly_order
             self.include_bias = include_bias
+            self.use_ortho = use_ortho
+            self.ortho_rcond = ortho_rcond
+            self.register_buffer("_ortho_transform", torch.empty(0), persistent=False)
+            self._ortho_ready = False
             # compute number of features P for monomials up to poly_order
             # include_bias adds constant feature
             self.feature_count = 0
@@ -36,7 +85,7 @@ def create_sindy_library(input_dim: int,
                     torch.combinations(torch.arange(input_dim), deg, with_replacement=True).shape[0]
                 )
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def _compute_features(self, x: torch.Tensor) -> torch.Tensor:
             """
             Evaluate the SINDy library on input x.
             x shape: (..., input_dim)
@@ -58,7 +107,33 @@ def create_sindy_library(input_dim: int,
             # concatenate along feature dimension
             return torch.cat(features, dim=-1)
 
-    return SINDyLibrary(input_dim, poly_order, include_bias)
+        def _apply_ortho(self, Theta: torch.Tensor) -> torch.Tensor:
+            if not self._ortho_ready:
+                Theta_flat = Theta.reshape(-1, Theta.shape[-1])
+                Theta_ortho_flat, transform = build_orthonormal_basis(
+                    Theta_flat, rcond=self.ortho_rcond
+                )
+                self._ortho_transform = transform
+                self._ortho_ready = True
+                self.feature_count = transform.shape[1]
+                return Theta_ortho_flat.reshape(Theta.shape[:-1] + (transform.shape[1],))
+
+            if self._ortho_transform.numel() == 0:
+                return Theta.new_zeros(Theta.shape[:-1] + (0,))
+
+            Theta_flat = Theta.reshape(-1, Theta.shape[-1])
+            Theta_ortho_flat = Theta_flat @ self._ortho_transform
+            return Theta_ortho_flat.reshape(
+                Theta.shape[:-1] + (self._ortho_transform.shape[1],)
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            Theta = self._compute_features(x)
+            if not self.use_ortho:
+                return Theta
+            return self._apply_ortho(Theta)
+
+    return SINDyLibrary(input_dim, poly_order, include_bias, use_ortho, ortho_rcond)
 
 def create_predictor(Xi: torch.Tensor, library):
     """
@@ -222,18 +297,27 @@ def assemble_weak_matrices(X_data: torch.Tensor,
 
 def assemble_strong_matrices(X_data: torch.Tensor,
                              Theta: torch.Tensor,
-                             t_span: torch.Tensor):
+                             t_span: torch.Tensor,
+                             fd_order: int = 2):
     dt = t_span[1] - t_span[0]
-    dxdt = get_derivative(dt, X_data)  # shape (n_t-2, d)
-    Thetam2 = Theta[1:-1]  # shape (n_t-2, P) to match dxdt shape
-    return dxdt, Thetam2
-
-def get_derivative(dt, x: torch.Tensor):
+    # dxdt, Thetam2 = get_derivative(dt, X_data, Theta)  # shape (n_t-2, d)
     # assume equispaced t, with dt = 1
     # x: (..., N), return (..., N-2)
-    dxdt = x[2:] - x[:-2]
-    dxdt = dxdt / (2 * dt)  # central difference
-    return dxdt
+    if fd_order == 1:
+        dxdt = X_data[1:] - X_data[:-1]
+        dxdt = dxdt / dt  # forward difference
+        Thetam2 = Theta[:-1]  # shape (n_t-1, P) to match dxdt shape
+    elif fd_order == 2:
+        dxdt = X_data[2:] - X_data[:-2]
+        dxdt = dxdt / (2 * dt)  # central difference
+        Thetam2 = Theta[1:-1]  # shape (n_t-2, P) to match dxdt shape
+    elif fd_order == 4:
+        # 4th order central difference
+        dxdt = (-X_data[4:] + 8 * X_data[3:-1] - 8 * X_data[1:-3] + X_data[:-4]) / (12 * dt)
+        Thetam2 = Theta[2:-2]  # shape (n_t-4, P) to match dxdt shape
+    else:
+        raise ValueError(f"fd_order {fd_order} not supported")
+    return dxdt, Thetam2
 
 
 #%% Linear system solving
@@ -254,7 +338,7 @@ class DenseSolverParams(BaseSolverParams):
     driver: Optional[str] = None
 
 @dataclass
-class SparseSolverParams(BaseSolverParams):
+class OldSparseSolverParams(BaseSolverParams):
     """Collected parameters for the sparse solver.
 
     Args:
@@ -289,9 +373,9 @@ def dense_solver(rhs_mat: torch.Tensor,
                               rcond=dense_solver_params.rcond,
                               driver=dense_solver_params.driver).solution
 
-def stls_sparse_solver(rhs_mat: torch.Tensor,
+def old_stls_sparse_solver(rhs_mat: torch.Tensor,
                        lhs_target: torch.Tensor,
-                       sparse_solver_params: SparseSolverParams = None
+                       sparse_solver_params: OldSparseSolverParams = None
                        ) -> torch.Tensor:
     r"""
 
@@ -402,7 +486,163 @@ class SINDyParams:
     poly_order: int = 1
     include_bias: bool = True
     truncation_rank: Optional[int] = None
-    method: str = 'weak'
+    method: str = 'strong'
     test_func_params: Optional[TestFunctionParams] = None
     solver_fn: BaseSolver = dense_solver
     solver_params: Optional[BaseSolverParams] = None
+    fd_order: Optional[int] = 2
+    use_ortho: bool = False
+
+# %% New STLSQ solver and params
+@dataclass
+class STLSQParams:
+    """
+    Minimal STLSQ params aligned with PySINDy defaults.
+
+    threshold: hard-threshold applied to coefficients after each refit
+    alpha: ridge regularization strength (alpha=0 reduces to plain least squares)
+    max_iter: maximum STLSQ iterations
+    normalize_columns: if True, normalize columns of rhs_mat before regression (and unscale at end)
+    unbias: if True, do a final unregularized refit on the selected support
+    """
+    threshold: float = 0.1
+    alpha: float = 0.05
+    max_iter: int = 20
+    normalize_columns: bool = False
+    unbias: bool = True
+
+
+def stlsq_sparse_solver(
+    rhs_mat: torch.Tensor,                 # Theta / X: (n_samples, n_features)
+    lhs_target: torch.Tensor,              # y:         (n_samples, n_targets) or (n_samples,)
+    params: Optional[STLSQParams] = None
+) -> torch.Tensor:
+    r"""
+    Solve lhs_target ≈ rhs_mat @ Xi with sparse Xi using sequentially-thresholded least squares (STLSQ).
+
+    Iteration:
+      1) Ridge regression on current support
+      2) Hard threshold coefficients by magnitude
+      3) Update support; stop when support does not change
+
+    Returns:
+      Xi of shape (n_features, n_targets)
+    """
+    if params is None:
+        params = STLSQParams()
+
+    if params.threshold < 0:
+        raise ValueError("threshold cannot be negative")
+    if params.alpha < 0:
+        raise ValueError("alpha cannot be negative")
+    if params.max_iter <= 0:
+        raise ValueError("max_iter must be positive")
+
+    X = rhs_mat
+    y = lhs_target
+
+    if y.ndim == 1:
+        y = y.unsqueeze(1)
+    if X.ndim != 2 or y.ndim != 2:
+        raise ValueError("rhs_mat must be 2D and lhs_target must be 1D or 2D")
+
+    n_samples, n_features = X.shape
+    if y.shape[0] != n_samples:
+        raise ValueError(f"lhs_target has {y.shape[0]} rows but rhs_mat has {n_samples}")
+
+    device, dtype = X.device, X.dtype
+    n_targets = y.shape[1]
+
+    # Special case: no thresholding, no ridge -> basic least squares on original X
+    if params.threshold == 0.0 and params.alpha == 0.0:
+        return torch.linalg.lstsq(X, y).solution
+
+    # ---- Optional column normalization ----
+    if params.normalize_columns:
+        col_norms = torch.linalg.norm(X, ord=2, dim=0, keepdim=True)  # (1, n_features)
+        col_norms = torch.where(col_norms == 0, torch.ones_like(col_norms), col_norms)
+        Xn = X / col_norms
+    else:
+        col_norms = torch.ones((1, n_features), device=device, dtype=dtype)
+        Xn = X
+
+    # ---- Small helpers ----
+    def ridge_solve(Xa: torch.Tensor, ya: torch.Tensor, alpha: float) -> torch.Tensor:
+        """
+        Solve argmin_w ||Xa w - ya||_2^2 + alpha ||w||_2^2
+
+        Xa: (n, p), ya: (n,) or (n, k)
+        Returns w: (p,) or (p, k)
+        """
+        p = Xa.shape[1]
+        if p == 0:
+            return torch.zeros((0,) if ya.ndim == 1 else (0, ya.shape[1]), device=device, dtype=dtype)
+
+        if alpha == 0.0:
+            # Plain least squares
+            return torch.linalg.lstsq(Xa, ya).solution
+
+        n = Xa.shape[0]
+        use_dual = p > n
+        if use_dual:
+            warnings.warn("Using dual ridge solve because more features than data.")
+            A = Xa @ Xa.T
+            A = A + alpha * torch.eye(n, device=device, dtype=dtype)
+            z = torch.linalg.solve(A, ya)
+            return Xa.T @ z
+
+        A = Xa.T @ Xa
+        A = A + alpha * torch.eye(p, device=device, dtype=dtype)
+        b = Xa.T @ ya
+        return torch.linalg.solve(A, b)
+
+    def ls_solve(Xa: torch.Tensor, ya: torch.Tensor) -> torch.Tensor:
+        """Unregularized least squares with a simple fallback if lstsq fails."""
+        # try:
+        return torch.linalg.lstsq(Xa, ya).solution
+        # except RuntimeError:
+        #     # Fallback: pseudoinverse
+        #     return torch.linalg.pinv(Xa) @ ya
+
+    # ---- STLSQ loop: support-stability stopping ----
+    support = torch.ones((n_features, n_targets), device=device, dtype=torch.bool)
+    Xi = torch.zeros((n_features, n_targets), device=device, dtype=dtype)
+
+    for _ in range(params.max_iter):
+        # Refit on current support (ridge)
+        Xi_new = torch.zeros_like(Xi)
+        for j in range(n_targets):
+            active = support[:, j]
+            if not torch.any(active):
+                continue
+            w_act = ridge_solve(Xn[:, active], y[:, j], params.alpha)  # (p,)
+            Xi_new[active, j] = w_act
+
+        # Threshold -> new support
+        new_support = Xi_new.abs() >= params.threshold
+        Xi_new = Xi_new * new_support.to(dtype=dtype)
+
+        # Stop if support unchanged
+        if torch.equal(new_support, support):
+            Xi = Xi_new
+            break
+
+        support = new_support
+        Xi = Xi_new
+
+    # ---- Optional unbias: final unregularized refit on the selected support ----
+    if params.unbias:
+        Xi_unb = torch.zeros_like(Xi)
+        for j in range(n_targets):
+            active = support[:, j]
+            if not torch.any(active):
+                continue
+            w_act = ls_solve(Xn[:, active], y[:, j])  # (p,)
+            Xi_unb[active, j] = w_act
+        Xi = Xi_unb
+
+    # ---- Unnormalize coefficients ----
+    if params.normalize_columns:
+        Xi = Xi / col_norms.T  # (n_features, 1) broadcast over targets
+
+    return Xi
