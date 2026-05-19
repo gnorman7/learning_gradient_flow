@@ -10,6 +10,7 @@ dependencies = [
   "numpy",
   "torch>=2.0",
   "torchdiffeq",
+  "matplotlib",
 ]
 
 [project.optional-dependencies]
@@ -17,7 +18,6 @@ dev = [
   "pytest",
 ]
 examples = [
-  "matplotlib",
   "calfem-python",
 ]
 
