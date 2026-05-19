@@ -239,7 +239,7 @@ def run_example(
             error = 0.5 * dt * torch.sum((G @ u_local - v) ** 2)
             return error
 
-    optimizer_names = ['AppendixAdam', 'AppendixAdamLearned']
+    optimizer_names = ['BaseAdam', 'LGFAdam']
     optimizers = {}
     for opt_name in optimizer_names:
         optimizers[opt_name] = {
@@ -275,12 +275,12 @@ def run_example(
         use_ortho=False,
     )
 
-    optimizers['AppendixAdam']['optimizer'] = torch.optim.Adam(
-        optimizers['AppendixAdam']['model'].parameters(), lr=lr, betas=betas
+    optimizers['BaseAdam']['optimizer'] = torch.optim.Adam(
+        optimizers['BaseAdam']['model'].parameters(), lr=lr, betas=betas
     )
 
-    optimizers['AppendixAdamLearned']['optimizer'] = adam_flow_optimizer.AppendixAdamContLearned(
-        optimizers['AppendixAdamLearned']['model'].parameters(),
+    optimizers['LGFAdam']['optimizer'] = adam_flow_optimizer.LGFAdam(
+        optimizers['LGFAdam']['model'].parameters(),
         lr=lr,
         betas=betas,
         history_size=history_size,
@@ -312,7 +312,7 @@ def run_example(
             opt_data['optimization_time_sec'] += time.perf_counter() - step_start_time
 
             if (
-                opt_name == 'AppendixAdamLearned'
+                opt_name == 'LGFAdam'
                 and SKIP_UNUSED_EVALS
                 and len(optimizer.state["history"]) >= history_size
                 and optimizer.dynamics is not None
@@ -325,14 +325,14 @@ def run_example(
         dif = torch.linalg.norm(torch.abs(model.a) - m_true)
 
         if epoch % 10 == 0:
-            adam_loss = optimizers["AppendixAdam"]["losses"][-1]
-            lgf_loss = optimizers["AppendixAdamLearned"]["losses"][-1]
+            adam_loss = optimizers["BaseAdam"]["losses"][-1]
+            lgf_loss = optimizers["LGFAdam"]["losses"][-1]
             print(f'epoch {epoch}, parameter error {round(dif.item(), 2)}')
             print(f'Adam loss: {round(adam_loss, 4)}, LGF loss: {round(lgf_loss, 4)}')
     optimization_elapsed = time.perf_counter() - optimization_start_time
 
-    adam_params = torch.stack(optimizers['AppendixAdam']['param_history'])
-    sindy_params_hist = torch.stack(optimizers['AppendixAdamLearned']['param_history'])
+    adam_params = torch.stack(optimizers['BaseAdam']['param_history'])
+    sindy_params_hist = torch.stack(optimizers['LGFAdam']['param_history'])
 
     if output_dir is None:
         output_dir = Path(__file__).resolve().parent / "outputs" / "ex4_scattering_tests"
@@ -348,8 +348,8 @@ def run_example(
 
     np.savetxt(output_dir / f'{prefix}adam_params.txt', adam_params.numpy(), fmt='%.6f')
     np.savetxt(output_dir / f'{prefix}sindy_params.txt', sindy_params_hist.numpy(), fmt='%.6f')
-    np.savetxt(output_dir / f'{prefix}adam_losses.txt', optimizers['AppendixAdam']['losses'])
-    np.savetxt(output_dir / f'{prefix}sindy_losses.txt', optimizers['AppendixAdamLearned']['losses'])
+    np.savetxt(output_dir / f'{prefix}adam_losses.txt', optimizers['BaseAdam']['losses'])
+    np.savetxt(output_dir / f'{prefix}sindy_losses.txt', optimizers['LGFAdam']['losses'])
 
     adam_params = torch.abs(torch.tensor(np.loadtxt(output_dir / f'{prefix}adam_params.txt'), dtype=torch.float32))
     sindy_params_hist = torch.abs(torch.tensor(np.loadtxt(output_dir / f'{prefix}sindy_params.txt'), dtype=torch.float32))
@@ -441,8 +441,8 @@ def run_example(
 
     timing_file = output_dir / f"{prefix}timings.txt"
     with open(timing_file, 'w') as f:
-        f.write(f"AppendixAdam optimization_time_sec: {optimizers['AppendixAdam']['optimization_time_sec']:.6f}\n")
-        f.write(f"AppendixAdamLearned optimization_time_sec: {optimizers['AppendixAdamLearned']['optimization_time_sec']:.6f}\n")
+        f.write(f"BaseAdam optimization_time_sec: {optimizers['BaseAdam']['optimization_time_sec']:.6f}\n")
+        f.write(f"LGFAdam optimization_time_sec: {optimizers['LGFAdam']['optimization_time_sec']:.6f}\n")
         f.write(f"total_optimization_wall_clock_sec: {optimization_elapsed:.6f}\n")
         f.write(f"total epochs: {epochs}\n")
         f.write(f"skip_unused_evals: {int(SKIP_UNUSED_EVALS)}\n")
@@ -451,8 +451,8 @@ def run_example(
         "mse_adam": mse_adam.item(),
         "mse_sindy": mse_sindy.item(),
         "timings": {
-            "AppendixAdam_optimization_time_sec": optimizers['AppendixAdam']['optimization_time_sec'],
-            "AppendixAdamLearned_optimization_time_sec": optimizers['AppendixAdamLearned']['optimization_time_sec'],
+            "BaseAdam_optimization_time_sec": optimizers['BaseAdam']['optimization_time_sec'],
+            "LGFAdam_optimization_time_sec": optimizers['LGFAdam']['optimization_time_sec'],
             "total_optimization_wall_clock_sec": optimization_elapsed,
         },
     }

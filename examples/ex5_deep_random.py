@@ -136,7 +136,7 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
             energy = Psi - torch.einsum('xi,xi->', B_local, u_local) / batch
             return energy
 
-    optimizer_names = ['AppendixAdam', 'AppendixAdamLearned']
+    optimizer_names = ['BaseAdam', 'LGFAdam']
 
     optimizers = {}
     for opt_name in optimizer_names:
@@ -169,12 +169,12 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
         solver_params=solver_params,
     )
 
-    optimizers['AppendixAdam']['optimizer'] = adam_flow_optimizer.AppendixAdam(
-        optimizers['AppendixAdam']['model'].parameters(), lr=lr, betas=betas
+    optimizers['BaseAdam']['optimizer'] = adam_flow_optimizer.BaseAdam(
+        optimizers['BaseAdam']['model'].parameters(), lr=lr, betas=betas
     )
 
-    optimizers['AppendixAdamLearned']['optimizer'] = adam_flow_optimizer.AppendixAdamContLearned(
-        optimizers['AppendixAdamLearned']['model'].parameters(),
+    optimizers['LGFAdam']['optimizer'] = adam_flow_optimizer.LGFAdam(
+        optimizers['LGFAdam']['model'].parameters(),
         lr=lr,
         betas=betas,
         history_size=history_size,
@@ -209,8 +209,8 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
         if epoch % 100 == 0:
             print(f"epoch {epoch}")
 
-    uadam = optimizers['AppendixAdam']['model'].forward(X).detach()
-    usindy = optimizers['AppendixAdamLearned']['model'].forward(X).detach()
+    uadam = optimizers['BaseAdam']['model'].forward(X).detach()
+    usindy = optimizers['LGFAdam']['model'].forward(X).detach()
 
     dif = uadam - usindy
     mag_dif = (dif[:, 0] ** 2 + dif[:, 1] ** 2 + dif[:, 2] ** 2)
@@ -221,8 +221,8 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
 
     error = numerator / denominator
 
-    adam_params = torch.stack(optimizers['AppendixAdam']['param_history'])
-    sindy_params_hist = torch.stack(optimizers['AppendixAdamLearned']['param_history'])
+    adam_params = torch.stack(optimizers['BaseAdam']['param_history'])
+    sindy_params_hist = torch.stack(optimizers['LGFAdam']['param_history'])
 
     if output_dir is None:
         output_dir = Path(__file__).resolve().parent / "outputs" / "ex5_deep_random"
@@ -234,8 +234,8 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
 
     np.savetxt(output_dir / f"{prefix}adam_params.txt", adam_params.numpy(), fmt='%.6f')
     np.savetxt(output_dir / f"{prefix}sindy_params.txt", sindy_params_hist.numpy(), fmt='%.6f')
-    np.savetxt(output_dir / f"{prefix}adam_losses.txt", optimizers['AppendixAdam']['losses'])
-    np.savetxt(output_dir / f"{prefix}sindy_losses.txt", optimizers['AppendixAdamLearned']['losses'])
+    np.savetxt(output_dir / f"{prefix}adam_losses.txt", optimizers['BaseAdam']['losses'])
+    np.savetxt(output_dir / f"{prefix}sindy_losses.txt", optimizers['LGFAdam']['losses'])
 
     adam_losses = torch.tensor(np.loadtxt(output_dir / f"{prefix}adam_losses.txt"), dtype=torch.float32)
     sindy_losses = torch.tensor(np.loadtxt(output_dir / f"{prefix}sindy_losses.txt"), dtype=torch.float32)

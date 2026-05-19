@@ -170,7 +170,7 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
     # ode_solver_options = {"method": "dopri5", "atol": lr/10, "rtol": lr/10}
     # ode_solver_options = {}
 
-    optimizers['sindy_flow']['optimizer'] = gradient_flow_optimizer.SINDyFlow(
+    optimizers['sindy_flow']['optimizer'] = gradient_flow_optimizer.LGFGradientFlow(
         optimizers['sindy_flow']['model'].parameters(),
         backup_optimizer=torch.optim.SGD(
             optimizers['sindy_flow']['model'].parameters(),

@@ -184,7 +184,7 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
 
     optimizers['sgd']['optimizer'] = torch.optim.SGD(optimizers['sgd']['model'].parameters(), lr=lr)
 
-    optimizers['sindy_flow']['optimizer'] = gradient_flow_optimizer.SINDyFlow(
+    optimizers['sindy_flow']['optimizer'] = gradient_flow_optimizer.LGFGradientFlow(
         optimizers['sindy_flow']['model'].parameters(),
         backup_optimizer=torch.optim.SGD(
             optimizers['sindy_flow']['model'].parameters(),
@@ -264,7 +264,7 @@ def run_example(threshold: float, alpha: float, normalize_columns: bool = True, 
                 else:
                     opt_data['check'] = 0
             else:
-                # In skip mode, SINDyFlow does not reevaluate the closure after the warmup phase,
+                # In skip mode, LGFGradientFlow does not reevaluate the closure after the warmup phase,
                 # so we keep tracking parameters without adding extra residual evaluations.
                 opt_data['losses'].append(float('nan'))
                 opt_data['param_history'].append(model.a.detach().clone())

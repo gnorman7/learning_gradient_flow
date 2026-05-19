@@ -146,7 +146,7 @@ def run_example(
     )
 
     model = Parameters()
-    optimizer = gradient_flow_optimizer.SINDyFlow(
+    optimizer = gradient_flow_optimizer.LGFGradientFlow(
         model.parameters(),
         backup_optimizer=torch.optim.SGD(model.parameters(), lr=lr),
         dt=lr,

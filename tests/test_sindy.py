@@ -1,8 +1,10 @@
 import torch
-import matplotlib.pyplot as plt
 from torchdiffeq import odeint
-# from src.learning_gradient_flow.sindy_tools import create_sindy_library, get_derivative, create_predictor
-from learning_gradient_flow.sindy_tools import create_sindy_library, get_derivative, create_predictor
+from learning_gradient_flow.sindy_tools import (
+    assemble_strong_matrices,
+    create_predictor,
+    create_sindy_library,
+)
 
 
 def test_sindy_oscillator():
@@ -32,7 +34,7 @@ def test_sindy_oscillator():
         # state shape: [2, 1]
         return A_mat @ state
 
-    x0 = torch.tensor([[1.0], [0.0]])  # Shape: [2, 1]
+    x0 = torch.tensor([1.0, 0.0])
     t_span = torch.linspace(0, 10, 200)
 
     # Generate the ground truth solution
@@ -41,9 +43,7 @@ def test_sindy_oscillator():
     library = create_sindy_library(input_dim=2, poly_order=2)
     Theta = library(true_solution)  # Shape: [100, P]
 
-    dt = t_span[1] - t_span[0]  # Time step size
-    dxdt = get_derivative(dt, true_solution)  # Shape: [98, 2]
-    Theta_m2 = Theta[1:-1]  # Shape: [98, P] to match dxdt shape
+    dxdt, Theta_m2 = assemble_strong_matrices(true_solution, Theta, t_span)
     # Xi shape: [P, 2] - Each column represents coefficients for one state variable
     Xi = torch.linalg.lstsq(Theta_m2, dxdt, rcond=1e-5).solution
 
@@ -55,7 +55,7 @@ def test_sindy_oscillator():
     sindy_system = lambda t, state: predictor(state)  # SINDy system function
 
     # 5. Simulate the discovered system
-    sindy_solution = odeint(sindy_system, x0, t_span).squeeze()  # Shape: [100, 2]
+    sindy_solution = odeint(sindy_system, x0, t_span)  # Shape: [100, 2]
 
     # 6. Compare true and SINDy solutions
     mse = torch.mean((true_solution - sindy_solution) ** 2)

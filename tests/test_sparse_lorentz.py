@@ -54,12 +54,12 @@ def test_sindy_oscillator():
 
     threshold = 0.05
     normalize_columns = False
-    sparse_solve_params = learning_gradient_flow.sindy_tools.SparseSolverParams(
+    sparse_solve_params = learning_gradient_flow.sindy_tools.STLSQParams(
         threshold=threshold,
         normalize_columns=normalize_columns,
     )
-    Xi = learning_gradient_flow.sindy_tools.stls_sparse_solver(
-        rhs_weak, lhs_weak, sparse_solver_params=sparse_solve_params)
+    Xi = learning_gradient_flow.sindy_tools.stlsq_sparse_solver(
+        rhs_weak, lhs_weak, params=sparse_solve_params)
 
     P, d = Xi.shape
     Xi_true = torch.zeros((P, d))
