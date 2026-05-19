@@ -6,6 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "learning_gradient_flow"
 version = "0.1.0"
 readme = "README.md"
+dependencies = [
+  "numpy",
+  "torch>=2.0",
+  "torchdiffeq",
+]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
