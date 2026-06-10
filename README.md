@@ -1,8 +1,9 @@
 # Learning Gradient Flow (LGF)
 
-Code for "Learning Gradient Flow: Using Equation Discovery to Accelerate Engineering Optimization," accepted for publication in *Computer Methods in Applied Mechanics and Engineering* (CMAME).
+Code for "Learning Gradient Flow: Using Equation Discovery to Accelerate Engineering Optimization," to be published in *Computer Methods in Applied Mechanics and Engineering* (CMAME).
 
-**Paper:** [arXiv:2602.13513](https://arxiv.org/abs/2602.13513)
+**CMAME:** [10.1016/j.cma.2026.119099](10.1016/j.cma.2026.119099)
+**arXiv:** [arXiv:2602.13513](https://arxiv.org/abs/2602.13513)
 
 ## Overview
 
@@ -14,10 +15,16 @@ The paper demonstrates LGF on problems from engineering mechanics and scientific
 
 ```bibtex
 @article{norman2026learning,
-  title={Learning Gradient Flow: Using Equation Discovery to Accelerate Engineering Optimization},
-  author={Norman, Grant and Rowan, Conor and Maute, Kurt and Doostan, Alireza},
-  journal={arXiv preprint arXiv:2602.13513},
-  year={2026}
+  title = {Learning gradient flow: Using equation discovery to accelerate engineering optimization},
+  journal = {Computer Methods in Applied Mechanics and Engineering},
+  volume = {460},
+  pages = {119099},
+  year = {2026},
+  issn = {0045-7825},
+  doi = {https://doi.org/10.1016/j.cma.2026.119099},
+  url = {https://www.sciencedirect.com/science/article/pii/S0045782526003725},
+  author = {Grant Norman and Conor Rowan and Kurt Maute and Alireza Doostan},
+  keywords = {Equation discovery, Data-driven modeling, Gradient flow, Surrogate models, Optimization}
 }
 ```
 
