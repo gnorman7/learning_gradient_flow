@@ -3,6 +3,7 @@
 Code for "Learning Gradient Flow: Using Equation Discovery to Accelerate Engineering Optimization," to be published in *Computer Methods in Applied Mechanics and Engineering* (CMAME).
 
 **CMAME:** [10.1016/j.cma.2026.119099](10.1016/j.cma.2026.119099)
+
 **arXiv:** [arXiv:2602.13513](https://arxiv.org/abs/2602.13513)
 
 ## Overview
